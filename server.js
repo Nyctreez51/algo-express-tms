@@ -7,6 +7,7 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const routes = require('./src/routes');
 const auth = require('./src/auth');
+const db = require('./src/db');
 
 const app = express();
 app.disable('x-powered-by');
@@ -25,4 +26,10 @@ app.use((err, req, res, next) => {
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {
   console.log(`ALGO Express TMS running on http://localhost:${PORT}`);
+  try {
+    const p = require('path');
+    const f = require('fs');
+    const diagPath = process.env.DB_PATH || p.join(__dirname, 'data', 'tms.db');
+    console.log(`[diag] DB_PATH=${diagPath} exists=${f.existsSync(diagPath)} users=${db.userCount()}`);
+  } catch (e) { console.log('[diag] failed: ' + e.message); }
 });
