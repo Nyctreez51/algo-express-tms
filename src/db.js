@@ -110,6 +110,21 @@ CREATE TABLE IF NOT EXISTS api_keys (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS documents (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id     TEXT NOT NULL,
+  load_id       INTEGER NOT NULL REFERENCES loads(id) ON DELETE CASCADE,
+  doc_type      TEXT NOT NULL CHECK (doc_type IN ('ratecon','pod')),
+  original_name TEXT NOT NULL,              -- filename as uploaded, for display/download
+  stored_path   TEXT NOT NULL,              -- absolute path on disk
+  mime          TEXT NOT NULL,
+  size_bytes    INTEGER NOT NULL,
+  uploaded_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  uploaded_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_documents_load ON documents(tenant_id, load_id);
+
 CREATE INDEX IF NOT EXISTS idx_loads_tenant_date ON loads(tenant_id, date);
 CREATE INDEX IF NOT EXISTS idx_loads_driver ON loads(tenant_id, driver_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_tenant_date ON expenses(tenant_id, date);
@@ -363,6 +378,31 @@ function deleteExpense(id, tenantId = TENANT) {
   db.prepare('DELETE FROM expenses WHERE id = ? AND tenant_id = ?').run(id, tenantId);
 }
 
+// ---- Documents (rate confirmations + PODs attached to loads) ----
+function listDocumentsByLoad(loadId, tenantId = TENANT) {
+  return db.prepare(`SELECT d.*, u.email AS uploaded_by_email
+    FROM documents d LEFT JOIN users u ON u.id = d.uploaded_by
+    WHERE d.load_id = ? AND d.tenant_id = ? ORDER BY d.uploaded_at`)
+    .all(loadId, tenantId);
+}
+function getDocument(id, tenantId = TENANT) {
+  return db.prepare('SELECT * FROM documents WHERE id = ? AND tenant_id = ?')
+    .get(id, tenantId);
+}
+function createDocument(doc, tenantId = TENANT) {
+  const r = db.prepare(`INSERT INTO documents
+    (tenant_id, load_id, doc_type, original_name, stored_path, mime, size_bytes, uploaded_by)
+    VALUES (?,?,?,?,?,?,?,?)`)
+    .run(tenantId, doc.load_id, doc.doc_type, doc.original_name, doc.stored_path,
+      doc.mime, doc.size_bytes, doc.uploaded_by || null);
+  return r.lastInsertRowid;
+}
+function deleteDocument(id, tenantId = TENANT) {
+  const d = getDocument(id, tenantId);
+  if (d) db.prepare('DELETE FROM documents WHERE id = ? AND tenant_id = ?').run(id, tenantId);
+  return d; // caller removes the file from disk
+}
+
 // ---- API keys ----
 function createApiKey(tenantId, name) {
   const key = 'tms_' + crypto.randomBytes(24).toString('hex');
@@ -394,5 +434,6 @@ module.exports = {
   listDrivers, getDriver, findDriverByName, saveDriver,
   listLoads, getLoad, saveLoad, upsertLoad, deleteLoad,
   listExpenses, getExpense, saveExpense, upsertExpense, deleteExpense,
+  listDocumentsByLoad, getDocument, createDocument, deleteDocument,
   createApiKey, findTenantByApiKey, listApiKeys, deleteApiKey,
 };

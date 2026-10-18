@@ -4,12 +4,68 @@
 'use strict';
 
 const express = require('express');
+const multer = require('multer');
+const path = require('node:path');
+const fs = require('node:fs');
+const crypto = require('node:crypto');
 const db = require('./db');
 const auth = require('./auth');
 const v = require('./views');
 const D = require('./dates');
 
 const router = express.Router();
+
+// ---------- document uploads (rate confirmations + PODs) ----------
+// Files live on disk under UPLOAD_DIR. On Railway, add a Volume mounted at
+// /data/uploads and set UPLOAD_DIR=/data/uploads so files survive redeploys.
+// Local default is ./data/uploads (never committed to the repo).
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'data', 'uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const ALLOWED_DOCS = {
+  'application/pdf': '.pdf',
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+};
+const ALLOWED_EXTS = ['.pdf', '.jpg', '.jpeg', '.png'];
+const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10MB per file
+
+const docStorage = multer.diskStorage({
+  destination(req, file, cb) {
+    const dir = path.join(UPLOAD_DIR, 'load_' + req.params.id);
+    fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename(req, file, cb) {
+    const ext = ALLOWED_DOCS[file.mimetype] ||
+      ALLOWED_EXTS.find(e => e === path.extname(file.originalname).toLowerCase()) || '.bin';
+    cb(null, crypto.randomBytes(16).toString('hex') + ext);
+  },
+});
+
+function docFileFilter(req, file, cb) {
+  const ext = path.extname(file.originalname).toLowerCase();
+  if (ALLOWED_DOCS[file.mimetype] && ALLOWED_EXTS.includes(ext)) return cb(null, true);
+  cb(new Error('Only PDF, JPG, and PNG files are allowed (max 10MB each).'));
+}
+
+const uploadDocs = multer({
+  storage: docStorage,
+  fileFilter: docFileFilter,
+  limits: { fileSize: MAX_FILE_BYTES, files: 10 },
+}).array('files', 10);
+
+// Stream a stored file after auth + ownership checks (never a public directory).
+function serveDocument(res, doc, { download = false } = {}) {
+  if (!doc.stored_path || !fs.existsSync(doc.stored_path)) {
+    return res.status(404).send('File missing on disk.');
+  }
+  const safeName = String(doc.original_name).replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'document';
+  res.setHeader('Content-Type', doc.mime);
+  res.setHeader('Content-Length', doc.size_bytes);
+  res.setHeader('Content-Disposition', `${download ? 'attachment' : 'inline'}; filename="${safeName}"`);
+  fs.createReadStream(doc.stored_path).pipe(res);
+}
 
 // "$1,234.56" / 1234.56 / "" -> cents (integer)
 function toCents(x) {
@@ -209,7 +265,7 @@ router.get('/dashboard', auth.requireRoles('owner', 'editor', 'viewer'), (req, r
 
 // ----- loads -----
 router.get('/loads', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
-  res.send(v.loadsPage(req.user, db.listLoads(), db.listDrivers(), db.listTrucks(), req.query));
+  res.send(v.loadsPage(req.user, db.listLoads(), db.listDrivers(), db.listTrucks(), req.query, docCounts(T())));
 });
 router.get('/loads/new', auth.canEdit, (req, res) => {
   res.send(v.layout({ title: 'Add load', user: req.user, active: '/loads',
@@ -247,6 +303,79 @@ router.post('/loads/:id/edit', auth.canEdit, express.urlencoded({ extended: fals
 router.post('/loads/:id/delete', auth.canEdit, (req, res) => {
   db.deleteLoad(req.params.id);
   res.redirect('/loads?ok=Load+deleted.');
+});
+
+// ----- load detail + documents (owner/editor/viewer) -----
+function docCounts(tenantId) {
+  const rows = db.db.prepare(
+    'SELECT load_id, COUNT(*) AS c FROM documents WHERE tenant_id = ? GROUP BY load_id'
+  ).all(tenantId);
+  const m = {};
+  for (const r of rows) m[r.load_id] = r.c;
+  return m;
+}
+
+function loadDetailContext(id) {
+  const load = db.getLoad(id);
+  if (!load) return null;
+  const drv = load.driver_id ? db.getDriver(load.driver_id) : null;
+  const trk = load.truck_id ? db.getTruck(load.truck_id) : null;
+  load.driver_name = drv ? drv.name : null;
+  load.truck_label = trk
+    ? (trk.unit_number || [trk.year, trk.make, trk.model].filter(Boolean).join(' '))
+    : null;
+  return { load, docs: db.listDocumentsByLoad(load.id) };
+}
+
+router.get('/loads/:id', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  const ctx = loadDetailContext(req.params.id);
+  if (!ctx) return res.status(404).send('Not found');
+  res.send(v.loadDetailPage(req.user, ctx.load, ctx.docs, req.query));
+});
+
+router.post('/loads/:id/documents', auth.canEdit, (req, res) => {
+  const load = db.getLoad(req.params.id);
+  if (!load) return res.status(404).send('Load not found');
+  uploadDocs(req, res, (err) => {
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE'
+        ? 'A file was over the 10MB limit.'
+        : (err.message || 'Upload failed.');
+      return res.redirect(`/loads/${load.id}?err=${encodeURIComponent(msg)}`);
+    }
+    if (!req.files || !req.files.length) {
+      return res.redirect(`/loads/${load.id}?err=${encodeURIComponent('No files received — pick at least one file.')}`);
+    }
+    const docType = req.body.doc_type === 'pod' ? 'pod' : 'ratecon';
+    for (const f of req.files) {
+      db.createDocument({
+        load_id: load.id,
+        doc_type: docType,
+        original_name: String(f.originalname).slice(0, 200),
+        stored_path: f.path,
+        mime: f.mimetype,
+        size_bytes: f.size,
+        uploaded_by: req.user.id,
+      });
+    }
+    res.redirect(`/loads/${load.id}?ok=${encodeURIComponent(req.files.length + ' document(s) uploaded.')}`);
+  });
+});
+
+router.post('/documents/:id/delete', auth.canEdit, (req, res) => {
+  const doc = db.deleteDocument(req.params.id);
+  if (!doc) return res.status(404).send('Not found');
+  try { fs.unlinkSync(doc.stored_path); } catch (e) { /* already gone */ }
+  res.redirect(`/loads/${doc.load_id}?ok=${encodeURIComponent('Document deleted.')}`);
+});
+
+// Staff view/download of a document (owner/editor/viewer). Auth + tenant
+// scoping happen here; files are never served from a public directory.
+router.get('/documents/:id', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  const doc = db.getDocument(req.params.id);
+  const load = doc && db.getLoad(doc.load_id);
+  if (!doc || !load) return res.status(404).send('Not found');
+  serveDocument(res, doc, { download: req.query.download === '1' });
 });
 
 // ----- expenses -----
@@ -456,6 +585,28 @@ router.get('/driver/settlements', auth.requireRoles('driver'), (req, res) => {
       pay: Math.round(r.revenue * payPct / 100) };
   }).filter(w => w.loads > 0);
   res.send(v.driverSettlements(req.user, weeks));
+});
+
+// Driver load detail — own loads only, with their documents.
+router.get('/driver/loads/:id', auth.requireRoles('driver'), (req, res) => {
+  if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
+  const load = db.getLoad(req.params.id);
+  if (!load || load.driver_id !== req.user.driver_id) {
+    return res.status(404).send('Not found');
+  }
+  res.send(v.driverLoadDetail(req.user, load, db.listDocumentsByLoad(load.id)));
+});
+
+// Driver document view/download — ONLY documents on the driver's own loads.
+// 404 (not 403) so one driver can never confirm another driver's docs exist.
+router.get('/driver/documents/:id', auth.requireRoles('driver'), (req, res) => {
+  if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
+  const doc = db.getDocument(req.params.id);
+  const load = doc && db.getLoad(doc.load_id);
+  if (!doc || !load || load.driver_id !== req.user.driver_id) {
+    return res.status(404).send('Not found');
+  }
+  serveDocument(res, doc, { download: req.query.download === '1' });
 });
 
 module.exports = router;

@@ -128,6 +128,36 @@ function flash(q) {
   return '';
 }
 
+function fmtSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  if (n >= 1024) return Math.round(n / 1024) + ' KB';
+  return n + ' B';
+}
+
+function docTypePill(t) {
+  return t === 'pod'
+    ? '<span class="pill green">POD</span>'
+    : '<span class="pill amber">Rate con</span>';
+}
+
+// Shared document list. docBase is '/documents' for staff, '/driver/documents' for drivers.
+function docsTable(docs, { canManage, docBase }) {
+  const rows = docs.map(d => `<tr>
+<td>${docTypePill(d.doc_type)}</td>
+<td>${esc(d.original_name)}</td>
+<td class="num">${fmtSize(d.size_bytes)}</td>
+<td class="mut">${esc((d.uploaded_at || '').slice(0, 10))}</td>
+<td><div class="rowflex">
+<a class="btn small ghost" href="${docBase}/${d.id}">View</a>
+<a class="btn small ghost" href="${docBase}/${d.id}?download=1">Download</a>
+${canManage ? `<form method="post" action="/documents/${d.id}/delete" style="display:inline" onsubmit="return confirm('Delete this document?')"><button class="btn small danger">Delete</button></form>` : ''}
+</div></td></tr>`).join('');
+  return `<div class="tblwrap"><table>
+<tr><th>Type</th><th>File</th><th class="num">Size</th><th>Uploaded</th><th></th></tr>
+${rows || '<tr><td colspan="5" class="mut">No documents attached yet.</td></tr>'}</table></div>`;
+}
+
 // ---------- auth pages ----------
 function setupPage() {
   return layout({
@@ -191,11 +221,13 @@ ${d.expTrucks.map(c => `<tr><td>${esc(c.label)}</td><td class="num">${fmtMoney(c
 }
 
 // ---------- loads ----------
-function loadsPage(user, loads, drivers, trucks, q) {
+function loadsPage(user, loads, drivers, trucks, q, docCounts = {}) {
   const canE = user.role === 'owner' || user.role === 'editor';
   const rows = loads.map(l => {
     const gross = (l.linehaul_cents || 0) + (l.fsc_cents || 0);
-    return `<tr><td>${esc(fmtDate(l.date))}</td><td>${esc(l.origin || '')} → ${esc(l.destination || '')}</td>
+    const dc = docCounts[l.id] || 0;
+    return `<tr><td><a href="/loads/${l.id}">${esc(fmtDate(l.date))}</a></td>
+<td><a href="/loads/${l.id}">${esc(l.origin || '')} → ${esc(l.destination || '')}</a>${dc ? ` <span class="pill">📎 ${dc}</span>` : ''}</td>
 <td class="num">${fmtNum((l.loaded_miles || 0) + (l.empty_miles || 0))}</td>
 <td class="num">${fmtMoney(gross)}</td><td>${esc(l.driver_name || '—')}</td>
 <td>${esc(l.truck_label || '—')}</td><td>${esc(l.broker || '—')}</td>
@@ -209,6 +241,43 @@ ${canE ? '<a class="btn" href="/loads/new">+ Add load</a>' : ''}</div>
 <tr><th>Date</th><th>Lane</th><th class="num">Miles</th><th class="num">Gross</th><th>Driver</th><th>Truck</th><th>Broker</th><th></th></tr>
 ${rows || '<tr><td colspan="8" class="mut">No loads yet.</td></tr>'}</table></div>`,
   });
+}
+
+// Load detail: facts + rate confirmations / PODs. Upload + delete need editor/owner.
+function loadDetailPage(user, load, docs, q) {
+  const canE = user.role === 'owner' || user.role === 'editor';
+  const gross = (load.linehaul_cents || 0) + (load.fsc_cents || 0);
+  const body = `${flash(q)}
+<div class="rowflex"><h1 style="margin:0">Load — ${esc(fmtDate(load.date))}</h1><div class="spacer"></div>
+${canE ? `<a class="btn ghost" href="/loads/${load.id}/edit">Edit load</a>` : ''}
+<a class="btn ghost" href="/loads">All loads</a></div>
+<div class="card" style="margin-top:12px"><dl class="kv">
+<dt>Lane</dt><dd style="text-align:left">${esc(load.origin || '—')} → ${esc(load.destination || '—')}</dd>
+<dt>Date</dt><dd>${esc(fmtDate(load.date))}</dd>
+<dt>Miles</dt><dd>${fmtNum((load.loaded_miles || 0) + (load.empty_miles || 0))} (${fmtNum(load.loaded_miles || 0)} loaded + ${fmtNum(load.empty_miles || 0)} empty)</dd>
+<dt>Linehaul</dt><dd>${fmtMoney(load.linehaul_cents || 0)}</dd>
+<dt>Fuel surcharge</dt><dd>${fmtMoney(load.fsc_cents || 0)}</dd>
+<dt>Gross</dt><dd><b>${fmtMoney(gross)}</b></dd>
+<dt>Broker</dt><dd style="text-align:left">${esc(load.broker || '—')}</dd>
+<dt>Driver</dt><dd style="text-align:left">${esc(load.driver_name || '—')}</dd>
+<dt>Truck</dt><dd style="text-align:left">${esc(load.truck_label || '—')}</dd>
+<dt>Status</dt><dd style="text-align:left">${esc(load.status || '')}</dd>
+${load.notes ? `<dt>Notes</dt><dd style="text-align:left">${esc(load.notes)}</dd>` : ''}
+</dl></div>
+<h2>Documents — rate confirmations &amp; PODs</h2>
+${docsTable(docs, { canManage: canE, docBase: '/documents' })}
+${canE ? `<h2>Attach documents</h2>
+<form class="f card" method="post" action="/loads/${load.id}/documents" enctype="multipart/form-data">
+<div class="two">
+<div class="row"><label>Document type</label><select name="doc_type">
+<option value="ratecon">Rate confirmation</option>
+<option value="pod">Proof of delivery (POD)</option></select></div>
+<div class="row"><label>Files — PDF, JPG, or PNG, max 10MB each</label>
+<input type="file" name="files" multiple accept=".pdf,.jpg,.jpeg,.png" required></div></div>
+<button class="btn">Upload</button>
+<p class="mut" style="margin-top:8px">Upload the rate confirmation when the load is booked, and the POD when it delivers.</p>
+</form>` : ''}`;
+  return layout({ title: 'Load detail', user, active: '/loads', body });
 }
 
 function loadForm(l, drivers, trucks, q, isEdit) {
@@ -439,17 +508,33 @@ ${s.recent.map(l => `<tr><td>${esc(fmtDate(l.date))}</td>
 }
 
 function driverLoads(user, loads) {
-  const rows = loads.map(l => `<tr><td>${esc(fmtDate(l.date))}</td>
-<td>${esc(l.origin || '')} → ${esc(l.destination || '')}</td>
+  const rows = loads.map(l => `<tr><td><a href="/driver/loads/${l.id}">${esc(fmtDate(l.date))}</a></td>
+<td><a href="/driver/loads/${l.id}">${esc(l.origin || '')} → ${esc(l.destination || '')}</a></td>
 <td class="num">${fmtNum((l.loaded_miles || 0) + (l.empty_miles || 0))}</td>
 <td class="num">${fmtMoney((l.linehaul_cents || 0) + (l.fsc_cents || 0))}</td>
 <td>${esc(l.status || '')}</td></tr>`).join('');
   return layout({
     title: 'My loads', user, active: '/driver/loads',
-    body: `<h1>My loads</h1><div class="tblwrap"><table>
+    body: `<h1>My loads</h1><p class="mut" style="margin-bottom:10px">Tap a load to see its rate confirmation and POD documents.</p>
+<div class="tblwrap"><table>
 <tr><th>Date</th><th>Lane</th><th class="num">Miles</th><th class="num">Gross</th><th>Status</th></tr>
 ${rows || '<tr><td colspan="5" class="mut">No loads yet.</td></tr>'}</table></div>`,
   });
+}
+
+// Driver load detail — facts plus the driver's own rate con / POD documents.
+function driverLoadDetail(user, load, docs) {
+  const gross = (load.linehaul_cents || 0) + (load.fsc_cents || 0);
+  const body = `<h1 style="font-size:20px">${esc(load.origin || '')} → ${esc(load.destination || '')}</h1>
+<p class="mut" style="margin-bottom:12px">${esc(fmtDate(load.date))}</p>
+<div class="card"><dl class="kv">
+<dt>Miles</dt><dd>${fmtNum((load.loaded_miles || 0) + (load.empty_miles || 0))}</dd>
+<dt>Gross</dt><dd><b>${fmtMoney(gross)}</b></dd>
+<dt>Status</dt><dd style="text-align:left">${esc(load.status || '')}</dd>
+</dl></div>
+<h2>Documents</h2>
+${docsTable(docs, { canManage: false, docBase: '/driver/documents' })}`;
+  return layout({ title: 'Load detail', user, active: '/driver/loads', body });
 }
 
 function driverSettlements(user, weeks) {
@@ -512,8 +597,9 @@ ${rows || '<tr><td colspan="3" class="mut">No keys yet — generate one on the U
 module.exports = {
   esc, layout, flash,
   setupPage, loginPage,
-  dashboardPage, loadsPage, loadForm, expensesPage, expenseForm,
+  dashboardPage, loadsPage, loadForm, loadDetailPage,
+  expensesPage, expenseForm,
   settlementsPage, driversPage, driverForm, trucksPage, truckForm,
   usersPage, apiDocsPage,
-  driverHome, driverLoads, driverSettlements,
+  driverHome, driverLoads, driverLoadDetail, driverSettlements,
 };

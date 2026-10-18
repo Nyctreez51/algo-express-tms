@@ -1,8 +1,9 @@
 # ALGO Express TMS
 
 A multi-user Transportation Management System for ALGO Express LLC.
-Loads, expenses, drivers, equipment, settlements, and dashboards — with
-separate logins for the owner, dispatch, viewers, and drivers.
+Loads, expenses, drivers, equipment, settlements, document uploads
+(rate confirmations + PODs), and dashboards — with separate logins for
+the owner, dispatch, viewers, and drivers.
 
 ## Run it (one command)
 
@@ -28,15 +29,30 @@ Copy `.env.example` to `.env` to change defaults:
 | `PORT`         | `3000`           | Port the app listens on                   |
 | `DB_PATH`      | `./data/tms.db`  | Where the SQLite database file lives      |
 | `SESSION_DAYS` | `7`              | How long logins stay signed in            |
+| `UPLOAD_DIR`   | `./data/uploads` | Where rate confirmations + PODs are stored|
+
+## Documents — rate confirmations & PODs
+
+Every load has a detail page (click any load in the Loads list) with an
+**upload form** (owner/editor only): pick **Rate confirmation** or
+**Proof of delivery**, attach one or more files, upload. Only **PDF, JPG,
+PNG** up to **10MB** per file are accepted; anything else is rejected.
+
+- Staff (owner/editor/viewer) see View/Download links on the load detail
+  page; owner/editor can also delete documents.
+- Drivers see their **own** loads' documents only — a driver can never
+  view or download another driver's files (enforced server-side).
+- Files are stored on disk under `UPLOAD_DIR` and served through an
+  auth-checked route — never from a public directory.
 
 ## Roles
 
 | Role     | Who        | Can do                                                                 |
 |----------|------------|------------------------------------------------------------------------|
-| `owner`  | Tree       | Everything: all data, invite/disable users, API keys                   |
-| `editor` | Erica      | Add/edit loads, expenses, drivers, trucks. Cannot manage users.        |
-| `viewer` | Approved   | Read-only: dashboard + settlements. No data entry, no user management. |
-| `driver` | Drivers    | **Only their own numbers**, on phone-friendly pages: this week's pay/miles, YTD pay/miles/loads, their load list, their settlement history. They cannot see other drivers, company financials, or expenses. |
+| `owner`  | Tree       | Everything: all data, invite/disable users, API keys, upload/delete documents |
+| `editor` | Erica      | Add/edit loads, expenses, drivers, trucks; upload/delete documents. Cannot manage users. |
+| `viewer` | Approved   | Read-only: dashboard + settlements, view/download load documents. No data entry, no user management. |
+| `driver` | Drivers    | **Only their own numbers**, on phone-friendly pages: this week's pay/miles, YTD pay/miles/loads, their load list, their settlement history, and their own loads' rate confirmations + PODs. They cannot see other drivers, company financials, or expenses. |
 
 The owner creates logins on the **Users** page (email + temporary password +
 role). A `driver` login **must** be linked to that driver's record.
@@ -62,6 +78,24 @@ On your hosting (VPS, Railway, Render, etc.):
    pointing at the server's IP, then reverse-proxy to `localhost:3000`.
 4. In `src/auth.js`, uncomment the `secure: true` cookie flag once HTTPS
    is on.
+
+## Railway deploy (current hosting)
+
+1. Push to GitHub — Railway auto-deploys from the `main` branch.
+2. **Persistent uploads:** Railway's filesystem is wiped on every redeploy,
+   so uploaded rate confirmations and PODs need a Volume:
+   - In the Railway dashboard, open the `algo-express-tms` service →
+     **Volumes** → **New Volume**, mount path **`/data/uploads`**.
+   - On the service's **Variables** tab, set **`UPLOAD_DIR=/data/uploads`**.
+   - Redeploy. Uploads now survive redeploys.
+3. **Database persistence (important):** the SQLite database at
+   `./data/tms.db` is wiped on redeploy too. Put it on the same volume:
+   set **`DB_PATH=/data/tms.db`** in Variables (the `/data` parent is
+   created automatically). Back up by downloading the file from the
+   volume, or copy it before redeploys.
+4. Custom domain: service **Settings → Networking → Custom Domain**
+   (e.g. `tms.algoexpress.net`), then add the DNS records Railway shows
+   in Cloudflare.
 
 ## JSON sync API (for the daily sheet job)
 
@@ -130,7 +164,7 @@ Errors return `{"ok": false, "error": "..."}` with HTTP 400/401.
 ## For developers
 
 - Stack: Node 20+ (uses built-in `node:sqlite` — no native modules),
-  Express, bcryptjs. No build step, no frontend framework.
+  Express, bcryptjs, multer (document uploads). No build step, no frontend framework.
 - Source: `server.js` (entry), `src/db.js` (schema/seed/queries),
   `src/auth.js` (sessions/roles), `src/routes.js` (pages + API),
   `src/views.js` (templates), `src/dates.js` (settlement-week math).
