@@ -78,6 +78,7 @@ function navFor(user) {
     `<a href="${href}" class="${active === href ? 'on' : ''}">${label}</a>`;
   if (r === 'driver') return ''; // drivers use the bottom tab bar
   let links = link('/dashboard', 'Dashboard', '/dashboard')
+    + link('/fleet', 'Fleet map', '/fleet')
     + link('/loads', 'Loads', '/loads')
     + link('/expenses', 'Expenses', '/expenses')
     + link('/settlements', 'Settlements', '/settlements');
@@ -355,6 +356,9 @@ ${cats.map(c => `<option value="${c}" ${e.category === c ? 'selected' : ''}>${c}
 <div class="two">
 <div class="row"><label>Truck</label><select name="truck_id"><option value="">—</option>${trkOpts}</select></div>
 <div class="row"><label>Amount $</label><input name="amount" type="number" step="0.01" min="0" required value="${e.amount_cents != null ? esc((e.amount_cents / 100).toFixed(2)) : ''}"></div></div>
+<div class="two">
+<div class="row"><label>Gallons (fuel only, for IFTA)</label><input name="gallons" type="number" step="0.001" min="0" value="${e.gallons != null ? esc(String(e.gallons)) : ''}"></div>
+<div class="row"><label>Fuel state (IFTA, 2 letters)</label><input name="fuel_state" maxlength="2" style="text-transform:uppercase" value="${esc(e.fuel_state || '')}" placeholder="GA"></div></div>
 <div class="row"><label>External ID (sheet sync)</label><input name="external_id" value="${esc(e.external_id || '')}"></div>
 <div class="row"><label>Notes</label><textarea name="notes" rows="2">${esc(e.notes || '')}</textarea></div>
 <button class="btn">Save expense</button>
@@ -504,9 +508,42 @@ ${newKey ? `<div class="okmsg">New API key (shown once — copy it now):<br><cod
 
 // ---------- driver-facing pages (mobile-first, own data only) ----------
 function driverHome(user, s) {
+  const trip = s.trip;
+  const loadOpts = (s.openLoads || []).map(l =>
+    `<option value="${l.id}">${esc(fmtDate(l.date))} · ${esc(l.origin || '')} → ${esc(l.destination || '')}</option>`).join('');
+  const tripCard = trip ? `
+<div class="card" style="margin-bottom:12px">
+<p style="margin:0 0 6px"><span class="pill green">● LIVE</span> <b>Trip active — sharing your location</b></p>
+<p class="mut" style="margin:0 0 8px">Keep this page open while driving. iPhones stop sharing when the screen locks. Location stops when you end the trip.</p>
+<form method="post" action="/driver/trip/end"><button class="btn danger">End trip</button></form>
+<div id="tripstatus" class="mut" style="margin-top:8px"></div></div>
+<script>(function(){
+var el=document.getElementById('tripstatus');
+if(!navigator.geolocation){el.textContent='Location not supported on this device.';return;}
+var lastSent=0;
+function send(pos){
+  var now=Date.now(); if(now-lastSent<45000) return; lastSent=now;
+  fetch('/driver/position',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({lat:pos.coords.latitude,lon:pos.coords.longitude,
+      accuracy:pos.coords.accuracy,speed:pos.coords.speed,heading:pos.coords.heading})})
+    .then(function(r){return r.json();}).then(function(j){
+      el.textContent=j.ok?('Sharing ✓ '+new Date().toLocaleTimeString()):'Trip ended.';})
+    .catch(function(){el.textContent='Connection issue — will retry.';});
+}
+navigator.geolocation.watchPosition(send,
+  function(){el.textContent='Location permission needed — allow location access for this site.';},
+  {enableHighAccuracy:true,maximumAge:30000,timeout:20000});
+})();</script>` : `
+<div class="card" style="margin-bottom:12px">
+<p style="margin:0 0 8px"><b>Trip tracking</b></p>
+<p class="mut" style="margin:0 0 8px">Start a trip when you roll. Dispatch sees your live location until you end it.</p>
+<form method="post" action="/driver/trip/start"><div class="row">
+<label>Load (optional)</label><select name="load_id"><option value="">Just driving / positioning</option>${loadOpts}</select></div>
+<button class="btn">Start trip</button></form></div>`;
   const body = `
 <h1 style="font-size:20px">Hi, ${esc(user.driver_name || 'driver')} 👋</h1>
 <p class="mut" style="margin-bottom:12px">Week of ${esc(fmtWeekRange(s.weekStart))} · Fri–Thu</p>
+${tripCard}
 <div class="grid bigstat">
 ${statCard('This week pay', fmtMoney(s.week.pay), `${s.week.loads} loads`)}
 ${statCard('This week miles', fmtNum(s.week.miles), fmtMoney(s.week.gross) + ' gross')}
@@ -569,6 +606,51 @@ function driverSettlements(user, weeks) {
 <div class="tblwrap"><table>
 <tr><th>Week</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">Pay</th></tr>
 ${rows || '<tr><td colspan="5" class="mut">No settlements yet.</td></tr>'}</table></div>`,
+  });
+}
+
+// ---------- fleet map (live trip tracking) ----------
+function fleetPage(user) {
+  return layout({
+    title: 'Fleet map', user, active: '/fleet',
+    body: `<h1>Fleet map</h1>
+<p class="mut" style="margin-bottom:10px">Live positions from drivers' phones — only while a trip is active. Refreshes every 30 seconds.</p>
+<div id="fleetmap" style="height:55vh;min-height:320px;border-radius:12px;z-index:0"></div>
+<div id="fleetlist" style="margin-top:12px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>(function(){
+var map=L.map('fleetmap').setView([33.75,-84.39],6);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap contributors'}).addTo(map);
+var markers={};
+function ago(iso){
+  if(!iso) return 'no fix yet';
+  var s=Math.floor((Date.now()-new Date(iso.replace(' ','T')+'Z'))/1000);
+  if(s<60) return s+'s ago'; var m=Math.floor(s/60);
+  if(m<60) return m+'m ago'; return Math.floor(m/60)+'h '+(m%60)+'m ago';
+}
+function refresh(){
+  fetch('/fleet/data').then(function(r){return r.json();}).then(function(d){
+    var seen={}, html='';
+    d.trips.forEach(function(t){
+      seen[t.trip_id]=1;
+      var lane=t.origin?(' · '+t.origin+' → '+t.destination):'';
+      var mph=(t.speed!=null)?Math.round(t.speed)+' mph · ':'';
+      html+='<div class="card" style="margin-bottom:8px"><b>'+t.driver_name+'</b>'+lane+
+        '<div class="mut">'+mph+ago(t.recorded_at)+' · '+t.fixes+' fixes</div></div>';
+      if(t.lat!=null){
+        var popup='<b>'+t.driver_name+'</b>'+(t.origin?('<br>'+t.origin+' → '+t.destination):'')+
+          '<br>'+mph+ago(t.recorded_at);
+        if(markers[t.trip_id]){markers[t.trip_id].setLatLng([t.lat,t.lon]).setPopupContent(popup);}
+        else{markers[t.trip_id]=L.marker([t.lat,t.lon]).addTo(map).bindPopup(popup);}
+      }
+    });
+    Object.keys(markers).forEach(function(k){ if(!seen[k]){map.removeLayer(markers[k]);delete markers[k];} });
+    document.getElementById('fleetlist').innerHTML=html||'<p class="mut">No active trips right now.</p>';
+  }).catch(function(){});
+}
+refresh(); setInterval(refresh,30000);
+})();</script>`,
   });
 }
 

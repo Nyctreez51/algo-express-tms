@@ -195,6 +195,8 @@ router.post('/api/v1/expenses/upsert', apiAuth, express.json(), (req, res) => {
     category: cats.includes(b.category) ? b.category : 'other',
     amount_cents: toCents(b.amount),
     notes: b.notes || null,
+    gallons: b.gallons != null ? Number(b.gallons) : null,
+    fuel_state: b.fuel_state || b.state || null,
   }, req.tenantId);
   res.json({ ok: true, id: r.id, updated: r.updated });
 });
@@ -406,6 +408,7 @@ router.post('/expenses/new', auth.canEdit, express.urlencoded({ extended: false 
   db.saveExpense({
     date: b.date, truck_id: b.truck_id || null, category: b.category,
     amount_cents: toCents(b.amount), notes: b.notes, external_id: b.external_id,
+    gallons: b.gallons || null, fuel_state: b.fuel_state || null,
   });
   res.redirect('/expenses?ok=Expense+saved.');
 });
@@ -420,6 +423,7 @@ router.post('/expenses/:id/edit', auth.canEdit, express.urlencoded({ extended: f
   db.saveExpense({
     id: Number(req.params.id), date: b.date, truck_id: b.truck_id || null,
     category: b.category, amount_cents: toCents(b.amount), notes: b.notes,
+    gallons: b.gallons || null, fuel_state: b.fuel_state || null,
   });
   res.redirect('/expenses?ok=Expense+updated.');
 });
@@ -585,11 +589,15 @@ function driverStats(driverId) {
   const ytd = revenueBetween(y0, today, driverId);
   const payPct = (drv && drv.pay_pct) || 0;
   const recent = db.listLoads(T(), { driverId, limit: 10 });
+  const openLoads = db.listLoads(T(), { driverId, limit: 50 })
+    .filter(l => l.status === 'booked' || l.status === 'in_transit');
   return {
     weekStart: ws,
     week: { ...week, pay: Math.round(week.revenue * payPct / 100) },
     ytd: { ...ytd, pay: Math.round(ytd.revenue * payPct / 100) },
     recent, payPct,
+    trip: db.activeTrip(driverId, T()),
+    openLoads,
   };
 }
 
@@ -616,6 +624,37 @@ router.get('/driver/settlements', auth.requireRoles('driver'), (req, res) => {
       pay_basis: perMile ? `$${Number(drv.pay_rate).toFixed(2)}/mi` : `${payPct}%` };
   }).filter(w => w.loads > 0);
   res.send(v.driverSettlements(req.user, weeks));
+});
+
+// ----- live trip tracking (driver phone GPS) -----
+// Driver starts a trip; the phone posts positions while the page is open.
+router.post('/driver/trip/start', auth.requireRoles('driver'), express.urlencoded({ extended: false }), (req, res) => {
+  if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
+  const loadId = req.body.load_id ? Number(req.body.load_id) : null;
+  const id = db.startTrip(req.user.driver_id, loadId, T());
+  res.redirect('/driver?ok=Trip+started.+Keep+this+page+open+while+driving.');
+});
+router.post('/driver/trip/end', auth.requireRoles('driver'), express.urlencoded({ extended: false }), (req, res) => {
+  if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
+  db.endTrip(req.user.driver_id, T());
+  res.redirect('/driver?ok=Trip+ended.');
+});
+router.post('/driver/position', auth.requireRoles('driver'), express.json(), (req, res) => {
+  if (!req.user.driver_id) return res.status(403).json({ ok: false });
+  const b = req.body || {};
+  // Phones report speed in meters/second; store mph.
+  const mph = b.speed != null && Number.isFinite(Number(b.speed)) ? Number(b.speed) * 2.23694 : null;
+  const id = db.addPosition(req.user.driver_id,
+    { lat: b.lat, lon: b.lon, accuracy: b.accuracy, speed: mph, heading: b.heading }, T());
+  res.json({ ok: !!id });
+});
+
+// ----- fleet map (owner/editor) -----
+router.get('/fleet', auth.requireRoles('owner', 'editor'), (req, res) => {
+  res.send(v.fleetPage(req.user));
+});
+router.get('/fleet/data', auth.requireRoles('owner', 'editor'), (req, res) => {
+  res.json({ ok: true, trips: db.fleetSnapshot(T()) });
 });
 
 // Driver load detail — own loads only, with their documents.
