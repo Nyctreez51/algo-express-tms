@@ -173,3 +173,5 @@ Errors return `{"ok": false, "error": "..."}` with HTTP 400/401.
 - Driver pages (`/driver/*`) are mobile-first with a bottom tab bar and
   `apple-mobile-web-app-capable` meta tags — drivers can "Add to Home
   Screen" on iPhone for an app-like feel.
+
+<!-- storage persistence verified 2026-10-18 -->
