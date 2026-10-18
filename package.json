@@ -1,0 +1,1 @@
+{"dependencies":{"bcryptjs":"^2.4.3","cookie-parser":"^1.4.7","express":"^4.21.2"},"description":"ALGO Express LLC — Transportation Management System (multi-user, single command to run)","license":"UNLICENSED","main":"server.js","name":"algo-express-tms","scripts":{"start":"node server.js"},"version":"1.0.0"}

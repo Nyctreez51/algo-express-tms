@@ -1,0 +1,461 @@
+// routes.js — all HTTP routes: pages, auth, and the JSON sync API.
+// Money arrives from forms/API in DOLLARS and is stored as INTEGER cents.
+
+'use strict';
+
+const express = require('express');
+const db = require('./db');
+const auth = require('./auth');
+const v = require('./views');
+const D = require('./dates');
+
+const router = express.Router();
+
+// "$1,234.56" / 1234.56 / "" -> cents (integer)
+function toCents(x) {
+  if (x == null || x === '') return 0;
+  const n = Number(String(x).replace(/[$,]/g, ''));
+  return Number.isFinite(n) ? Math.round(n * 100) : 0;
+}
+function toNum(x, fb = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fb;
+}
+const T = () => db.TENANT;
+
+// ---------- public ----------
+router.get('/', (req, res) => {
+  if (db.userCount() === 0) return res.redirect('/setup');
+  if (!req.user) return res.redirect('/login');
+  return res.redirect(req.user.role === 'driver' ? '/driver' : '/dashboard');
+});
+
+router.get('/setup', (req, res) => {
+  if (db.userCount() > 0) return res.redirect('/login');
+  res.send(v.setupPage());
+});
+
+router.post('/setup', express.urlencoded({ extended: false }), (req, res) => {
+  if (db.userCount() > 0) return res.redirect('/login');
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const pw = String(req.body.password || '');
+  if (!email.includes('@') || pw.length < 8) {
+    return res.status(400).send(v.setupPage());
+  }
+  const id = db.createUser({
+    email, passwordHash: auth.hashPassword(pw), role: 'owner',
+  });
+  auth.startSession(res, db.findUserById(id));
+  res.redirect('/dashboard');
+});
+
+router.get('/login', (req, res) => {
+  if (req.user) return res.redirect('/');
+  res.send(v.loginPage(req.query));
+});
+
+router.post('/login', express.urlencoded({ extended: false }), (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const u = db.findUserByEmail(T(), email);
+  if (!u || !u.active || !auth.verifyPassword(String(req.body.password || ''), u.password_hash)) {
+    return res.status(401).send(v.loginPage({ err: 'Wrong email or password.' }));
+  }
+  auth.startSession(res, db.findUserById(u.id));
+  res.redirect(u.role === 'driver' ? '/driver' : '/dashboard');
+});
+
+router.get('/logout', (req, res) => {
+  auth.endSession(req, res);
+  res.redirect('/login');
+});
+
+router.get('/api/v1/health', (req, res) => res.json({ ok: true }));
+
+// ---------- JSON sync API (X-API-Key; NOT behind session login) ----------
+function apiAuth(req, res, next) {
+  const key = req.get('X-API-Key');
+  const tenantId = key && db.findTenantByApiKey(key);
+  if (!tenantId) return res.status(401).json({ ok: false, error: 'bad api key' });
+  req.tenantId = tenantId;
+  next();
+}
+
+function resolveDriverId(tenantId, ref) {
+  if (!ref) return null;
+  if (/^\d+$/.test(String(ref))) {
+    const d = db.getDriver(Number(ref), tenantId);
+    return d ? d.id : null;
+  }
+  const d = db.findDriverByName(String(ref).trim(), tenantId);
+  return d ? d.id : null;
+}
+function resolveTruckId(tenantId, ref) {
+  if (!ref) return null;
+  if (/^\d+$/.test(String(ref))) {
+    const t = db.getTruck(Number(ref), tenantId);
+    return t ? t.id : null;
+  }
+  const t = db.findTruckByUnit(String(ref).trim(), tenantId);
+  return t ? t.id : null;
+}
+
+router.post('/api/v1/loads/upsert', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  if (!b.date || !/^\d{4}-\d{2}-\d{2}$/.test(b.date)) {
+    return res.status(400).json({ ok: false, error: 'date is required (YYYY-MM-DD)' });
+  }
+  const r = db.upsertLoad({
+    external_id: b.external_id || null,
+    date: b.date,
+    origin: b.origin || null,
+    destination: b.destination || null,
+    loaded_miles: toNum(b.loaded_miles),
+    empty_miles: toNum(b.empty_miles),
+    linehaul_cents: toCents(b.linehaul),
+    fsc_cents: toCents(b.fuel_surcharge),
+    broker: b.broker || null,
+    driver_id: resolveDriverId(req.tenantId, b.driver ?? b.driver_id),
+    truck_id: resolveTruckId(req.tenantId, b.truck ?? b.truck_id),
+    status: b.status || 'delivered',
+    notes: b.notes || null,
+  }, req.tenantId);
+  res.json({ ok: true, id: r.id, updated: r.updated });
+});
+
+router.post('/api/v1/expenses/upsert', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  const cats = ['fuel', 'maintenance', 'insurance', 'tolls', 'other'];
+  if (!b.date || !/^\d{4}-\d{2}-\d{2}$/.test(b.date)) {
+    return res.status(400).json({ ok: false, error: 'date is required (YYYY-MM-DD)' });
+  }
+  if (b.amount == null || !Number.isFinite(Number(b.amount))) {
+    return res.status(400).json({ ok: false, error: 'amount is required' });
+  }
+  const r = db.upsertExpense({
+    external_id: b.external_id || null,
+    date: b.date,
+    truck_id: resolveTruckId(req.tenantId, b.truck ?? b.truck_id),
+    category: cats.includes(b.category) ? b.category : 'other',
+    amount_cents: toCents(b.amount),
+    notes: b.notes || null,
+  }, req.tenantId);
+  res.json({ ok: true, id: r.id, updated: r.updated });
+});
+
+// ---------- everything below needs a login ----------
+router.use(auth.requireAuth, auth.scopeGuard);
+
+// ----- dashboard (owner/editor/viewer) -----
+function revenueBetween(from, to, driverId = null) {
+  let sql = `SELECT COUNT(*) AS loads,
+      COALESCE(SUM(loaded_miles + empty_miles),0) AS miles,
+      COALESCE(SUM(linehaul_cents + fsc_cents),0) AS revenue
+    FROM loads WHERE tenant_id = ? AND date >= ? AND date <= ?`;
+  const p = [T(), from, to];
+  if (driverId) { sql += ' AND driver_id = ?'; p.push(driverId); }
+  return db.db.prepare(sql).get(...p);
+}
+
+function dashboardData() {
+  const today = D.todayStr();
+  const ws = D.weekStartOf(today);
+  const [w0, w1] = D.weekRange(ws);
+  const y0 = D.yearStart(today);
+  const m0 = D.monthStart(today);
+  const ytd = revenueBetween(y0, today);
+
+  const trucks = db.db.prepare(
+    `SELECT COALESCE(t.unit_number, (t.year || ' ' || t.make || ' ' || t.model)) AS label,
+      COALESCE((SELECT SUM(l.linehaul_cents + l.fsc_cents) FROM loads l
+        WHERE l.tenant_id = t.tenant_id AND l.truck_id = t.id AND l.date >= ?),0) AS revenue,
+      COALESCE((SELECT SUM(e.amount_cents) FROM expenses e
+        WHERE e.tenant_id = t.tenant_id AND e.truck_id = t.id AND e.date >= ?),0) AS expenses
+    FROM trucks t WHERE t.tenant_id = ? AND t.type = 'tractor' ORDER BY revenue DESC`
+  ).all(y0, y0, T());
+
+  const drivers = db.db.prepare(
+    `SELECT d.id, d.name, d.pay_pct,
+      COUNT(l.id) AS loads,
+      COALESCE(SUM(l.loaded_miles + l.empty_miles),0) AS miles,
+      COALESCE(SUM(l.linehaul_cents + l.fsc_cents),0) AS gross
+    FROM drivers d LEFT JOIN loads l
+      ON l.driver_id = d.id AND l.tenant_id = d.tenant_id AND l.date >= ?
+    WHERE d.tenant_id = ? GROUP BY d.id ORDER BY gross DESC`
+  ).all(y0, T());
+  drivers.forEach(x => { x.pay = Math.round(x.gross * (x.pay_pct || 0) / 100); });
+
+  const expCats = db.db.prepare(
+    `SELECT category, SUM(amount_cents) AS total FROM expenses
+     WHERE tenant_id = ? AND date >= ? GROUP BY category ORDER BY total DESC`
+  ).all(T(), y0);
+  const expTrucks = db.db.prepare(
+    `SELECT COALESCE(t.unit_number, (t.year || ' ' || t.make || ' ' || t.model), 'Unassigned') AS label,
+      SUM(e.amount_cents) AS total
+     FROM expenses e LEFT JOIN trucks t ON t.id = e.truck_id
+     WHERE e.tenant_id = ? AND e.date >= ? GROUP BY e.truck_id ORDER BY total DESC`
+  ).all(T(), y0);
+
+  return {
+    today: revenueBetween(today, today),
+    week: revenueBetween(w0, w1),
+    month: revenueBetween(m0, today),
+    ytd, trucks, drivers, expCats, expTrucks,
+  };
+}
+
+router.get('/dashboard', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  res.send(v.dashboardPage(req.user, dashboardData()));
+});
+
+// ----- loads -----
+router.get('/loads', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  res.send(v.loadsPage(req.user, db.listLoads(), db.listDrivers(), db.listTrucks(), req.query));
+});
+router.get('/loads/new', auth.canEdit, (req, res) => {
+  res.send(v.layout({ title: 'Add load', user: req.user, active: '/loads',
+    body: v.loadForm({}, db.listDrivers(), db.listTrucks(), req.query, false) }));
+});
+router.post('/loads/new', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  db.saveLoad({
+    date: b.date, origin: b.origin, destination: b.destination,
+    loaded_miles: toNum(b.loaded_miles), empty_miles: toNum(b.empty_miles),
+    linehaul_cents: toCents(b.linehaul), fsc_cents: toCents(b.fsc),
+    broker: b.broker, external_id: b.external_id,
+    driver_id: b.driver_id || null, truck_id: b.truck_id || null,
+    status: b.status, notes: b.notes,
+  });
+  res.redirect('/loads?ok=Load+saved.');
+});
+router.get('/loads/:id/edit', auth.canEdit, (req, res) => {
+  const l = db.getLoad(req.params.id);
+  if (!l) return res.status(404).send('Not found');
+  res.send(v.layout({ title: 'Edit load', user: req.user, active: '/loads',
+    body: v.loadForm(l, db.listDrivers(), db.listTrucks(), req.query, true) }));
+});
+router.post('/loads/:id/edit', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  db.saveLoad({
+    id: Number(req.params.id), date: b.date, origin: b.origin, destination: b.destination,
+    loaded_miles: toNum(b.loaded_miles), empty_miles: toNum(b.empty_miles),
+    linehaul_cents: toCents(b.linehaul), fsc_cents: toCents(b.fsc),
+    broker: b.broker, driver_id: b.driver_id || null, truck_id: b.truck_id || null,
+    status: b.status, notes: b.notes,
+  });
+  res.redirect('/loads?ok=Load+updated.');
+});
+router.post('/loads/:id/delete', auth.canEdit, (req, res) => {
+  db.deleteLoad(req.params.id);
+  res.redirect('/loads?ok=Load+deleted.');
+});
+
+// ----- expenses -----
+router.get('/expenses', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  res.send(v.expensesPage(req.user, db.listExpenses(), req.query));
+});
+router.get('/expenses/new', auth.canEdit, (req, res) => {
+  res.send(v.layout({ title: 'Add expense', user: req.user, active: '/expenses',
+    body: v.expenseForm({}, db.listTrucks(), req.query, false) }));
+});
+router.post('/expenses/new', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  db.saveExpense({
+    date: b.date, truck_id: b.truck_id || null, category: b.category,
+    amount_cents: toCents(b.amount), notes: b.notes, external_id: b.external_id,
+  });
+  res.redirect('/expenses?ok=Expense+saved.');
+});
+router.get('/expenses/:id/edit', auth.canEdit, (req, res) => {
+  const e = db.getExpense(req.params.id);
+  if (!e) return res.status(404).send('Not found');
+  res.send(v.layout({ title: 'Edit expense', user: req.user, active: '/expenses',
+    body: v.expenseForm(e, db.listTrucks(), req.query, true) }));
+});
+router.post('/expenses/:id/edit', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  db.saveExpense({
+    id: Number(req.params.id), date: b.date, truck_id: b.truck_id || null,
+    category: b.category, amount_cents: toCents(b.amount), notes: b.notes,
+  });
+  res.redirect('/expenses?ok=Expense+updated.');
+});
+router.post('/expenses/:id/delete', auth.canEdit, (req, res) => {
+  db.deleteExpense(req.params.id);
+  res.redirect('/expenses?ok=Expense+deleted.');
+});
+
+// ----- settlements (Fri–Thu weeks) -----
+function settlementWeek(weekStart) {
+  const [w0, w1] = D.weekRange(weekStart);
+  const y0 = D.yearStart(w1);
+  const rows = db.db.prepare(
+    `SELECT d.id, d.name, d.pay_pct,
+      COUNT(l.id) AS loads,
+      COALESCE(SUM(l.loaded_miles + l.empty_miles),0) AS miles,
+      COALESCE(SUM(l.linehaul_cents + l.fsc_cents),0) AS gross,
+      COALESCE((SELECT SUM(l2.linehaul_cents + l2.fsc_cents) FROM loads l2
+        WHERE l2.tenant_id = d.tenant_id AND l2.driver_id = d.id AND l2.date >= ?),0) AS ytd_gross,
+      COALESCE((SELECT COUNT(*) FROM loads l3
+        WHERE l3.tenant_id = d.tenant_id AND l3.driver_id = d.id AND l3.date >= ?),0) AS ytd_loads
+    FROM drivers d LEFT JOIN loads l
+      ON l.driver_id = d.id AND l.tenant_id = d.tenant_id AND l.date >= ? AND l.date <= ?
+    WHERE d.tenant_id = ? AND d.status = 'active'
+    GROUP BY d.id ORDER BY d.name`
+  ).all(y0, y0, w0, w1, T());
+  rows.forEach(r => {
+    r.pay = Math.round(r.gross * (r.pay_pct || 0) / 100);
+    r.ytd_pay = Math.round(r.ytd_gross * (r.pay_pct || 0) / 100);
+  });
+  return rows;
+}
+
+function recentWeekStarts(n = 26) {
+  const out = [];
+  let ws = D.weekStartOf(D.todayStr());
+  for (let i = 0; i < n; i++) { out.push(ws); ws = D.addDaysStr(ws, -7); }
+  return out;
+}
+
+router.get('/settlements', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  let week = req.query.week || D.weekStartOf(D.todayStr());
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) week = D.weekStartOf(D.todayStr());
+  res.send(v.settlementsPage(req.user, week, recentWeekStarts(), settlementWeek(week), req.query));
+});
+
+// ----- drivers -----
+router.get('/drivers', auth.canEdit, (req, res) => {
+  res.send(v.driversPage(req.user, db.listDrivers(), req.query));
+});
+router.get('/drivers/new', auth.canEdit, (req, res) => {
+  res.send(v.layout({ title: 'Add driver', user: req.user, active: '/drivers',
+    body: v.driverForm({}, req.query, false) }));
+});
+router.post('/drivers/new', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  db.saveDriver({ name: b.name.trim(), phone: b.phone, pay_pct: toNum(b.pay_pct, 30),
+    status: b.status, notes: b.notes });
+  res.redirect('/drivers?ok=Driver+added.');
+});
+router.get('/drivers/:id/edit', auth.canEdit, (req, res) => {
+  const d = db.getDriver(req.params.id);
+  if (!d) return res.status(404).send('Not found');
+  res.send(v.layout({ title: 'Edit driver', user: req.user, active: '/drivers',
+    body: v.driverForm(d, req.query, true) }));
+});
+router.post('/drivers/:id/edit', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  db.saveDriver({ id: Number(req.params.id), name: b.name.trim(), phone: b.phone,
+    pay_pct: toNum(b.pay_pct, 30), status: b.status, notes: b.notes });
+  res.redirect('/drivers?ok=Driver+updated.');
+});
+
+// ----- trucks -----
+router.get('/trucks', auth.canEdit, (req, res) => {
+  res.send(v.trucksPage(req.user, db.listTrucks(), req.query));
+});
+router.get('/trucks/new', auth.canEdit, (req, res) => {
+  res.send(v.layout({ title: 'Add unit', user: req.user, active: '/trucks',
+    body: v.truckForm({ type: 'tractor' }, req.query, false) }));
+});
+router.post('/trucks/new', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  db.saveTruck({ unit_number: b.unit_number, year: toNum(b.year) || null, make: b.make,
+    model: b.model, vin: b.vin, type: b.type, trailer_desc: b.trailer_desc,
+    status: b.status, notes: b.notes });
+  res.redirect('/trucks?ok=Unit+added.');
+});
+router.get('/trucks/:id/edit', auth.canEdit, (req, res) => {
+  const t = db.getTruck(req.params.id);
+  if (!t) return res.status(404).send('Not found');
+  res.send(v.layout({ title: 'Edit unit', user: req.user, active: '/trucks',
+    body: v.truckForm(t, req.query, true) }));
+});
+router.post('/trucks/:id/edit', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  db.saveTruck({ id: Number(req.params.id), unit_number: b.unit_number,
+    year: toNum(b.year) || null, make: b.make, model: b.model, vin: b.vin,
+    type: b.type, trailer_desc: b.trailer_desc, status: b.status, notes: b.notes });
+  res.redirect('/trucks?ok=Unit+updated.');
+});
+
+// ----- users + API keys (owner) -----
+router.get('/users', auth.ownerOnly, (req, res) => {
+  res.send(v.usersPage(req.user, db.listUsers(), db.listDrivers(), req.query, req.query.key));
+});
+router.post('/users/new', auth.ownerOnly, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  const email = String(b.email || '').trim().toLowerCase();
+  const role = b.role;
+  if (!email.includes('@') || !['owner', 'editor', 'viewer', 'driver'].includes(role)) {
+    return res.redirect('/users?err=Check+the+form.');
+  }
+  if (role === 'driver' && !b.driver_id) {
+    return res.redirect('/users?err=Pick+the+driver+this+login+belongs+to.');
+  }
+  if (db.findUserByEmail(T(), email)) {
+    return res.redirect('/users?err=That+email+already+has+a+login.');
+  }
+  db.createUser({
+    email, passwordHash: auth.hashPassword(String(b.password || '')),
+    role, driverId: b.driver_id || null,
+  });
+  res.redirect('/users?ok=Login+created.');
+});
+router.post('/users/:id/toggle', auth.ownerOnly, (req, res) => {
+  const u = db.findUserById(req.params.id);
+  if (u && u.id !== req.user.id) db.setUserActive(u.id, !u.active);
+  res.redirect('/users');
+});
+router.post('/api-keys', auth.ownerOnly, express.urlencoded({ extended: false }), (req, res) => {
+  const key = db.createApiKey(T(), String(req.body.name || 'sync').slice(0, 60));
+  res.redirect('/users?key=' + encodeURIComponent(key) + '&ok=Key+created+-+copy+it+now.');
+});
+router.post('/api-keys/:id/delete', auth.ownerOnly, (req, res) => {
+  db.deleteApiKey(req.params.id, T());
+  res.redirect('/api-docs?ok=Key+deleted.');
+});
+router.get('/api-docs', auth.ownerOnly, (req, res) => {
+  res.send(v.apiDocsPage(req.user, db.listApiKeys(), req.query));
+});
+
+// ----- driver self-service (driver role only; own data enforced) -----
+function driverStats(driverId) {
+  const drv = db.getDriver(driverId);
+  const today = D.todayStr();
+  const ws = D.weekStartOf(today);
+  const [w0, w1] = D.weekRange(ws);
+  const y0 = D.yearStart(today);
+  const week = revenueBetween(w0, w1, driverId);
+  const ytd = revenueBetween(y0, today, driverId);
+  const payPct = (drv && drv.pay_pct) || 0;
+  const recent = db.listLoads(T(), { driverId, limit: 10 });
+  return {
+    weekStart: ws,
+    week: { ...week, pay: Math.round(week.revenue * payPct / 100) },
+    ytd: { ...ytd, pay: Math.round(ytd.revenue * payPct / 100) },
+    recent, payPct,
+  };
+}
+
+router.get('/driver', auth.requireRoles('driver'), (req, res) => {
+  if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
+  res.send(v.driverHome(req.user, driverStats(req.user.driver_id)));
+});
+router.get('/driver/loads', auth.requireRoles('driver'), (req, res) => {
+  if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
+  res.send(v.driverLoads(req.user, db.listLoads(T(), { driverId: req.user.driver_id })));
+});
+router.get('/driver/settlements', auth.requireRoles('driver'), (req, res) => {
+  if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
+  const drv = db.getDriver(req.user.driver_id);
+  const payPct = (drv && drv.pay_pct) || 0;
+  const weeks = recentWeekStarts(26).map(weekStart => {
+    const [w0, w1] = D.weekRange(weekStart);
+    const r = revenueBetween(w0, w1, req.user.driver_id);
+    return { weekStart, loads: r.loads, miles: r.miles, gross: r.revenue,
+      pay: Math.round(r.revenue * payPct / 100) };
+  }).filter(w => w.loads > 0);
+  res.send(v.driverSettlements(req.user, weeks));
+});
+
+module.exports = router;

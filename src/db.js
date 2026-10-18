@@ -1,0 +1,398 @@
+// db.js — SQLite storage (Node's built-in node:sqlite), schema, seed data, queries.
+// Money is stored as INTEGER cents everywhere. Dates are TEXT 'YYYY-MM-DD'.
+// Every business table carries tenant_id so the app can one day serve many
+// fleets (Tree's resale goal). Today exactly one tenant is seeded: 'algo'.
+
+'use strict';
+
+const { DatabaseSync } = require('node:sqlite');
+const path = require('node:path');
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'tms.db');
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+const db = new DatabaseSync(DB_PATH);
+db.exec('PRAGMA journal_mode = WAL;');
+db.exec('PRAGMA foreign_keys = ON;');
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS companies (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id   TEXT NOT NULL UNIQUE,
+  name        TEXT NOT NULL,
+  mc_number   TEXT,
+  usdot_number TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id     TEXT NOT NULL,
+  email         TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL CHECK (role IN ('owner','editor','viewer','driver')),
+  driver_id     INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
+  active        INTEGER NOT NULL DEFAULT 1,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (tenant_id, email)
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token      TEXT PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trucks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id   TEXT NOT NULL,
+  unit_number TEXT,
+  year        INTEGER,
+  make        TEXT,
+  model       TEXT,
+  vin         TEXT,
+  type        TEXT NOT NULL DEFAULT 'tractor' CHECK (type IN ('tractor','trailer')),
+  trailer_desc TEXT,
+  status      TEXT NOT NULL DEFAULT 'active',
+  notes       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS drivers (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id   TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  phone       TEXT,
+  pay_pct     REAL NOT NULL DEFAULT 30,   -- percent of gross paid to driver
+  status      TEXT NOT NULL DEFAULT 'active',
+  notes       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS loads (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id      TEXT NOT NULL,
+  external_id    TEXT,                     -- id from Erica's sheet; upsert key
+  date           TEXT NOT NULL,            -- YYYY-MM-DD
+  origin         TEXT,
+  destination    TEXT,
+  loaded_miles   REAL NOT NULL DEFAULT 0,
+  empty_miles    REAL NOT NULL DEFAULT 0,
+  linehaul_cents INTEGER NOT NULL DEFAULT 0,
+  fsc_cents      INTEGER NOT NULL DEFAULT 0,
+  broker         TEXT,
+  driver_id      INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
+  truck_id       INTEGER REFERENCES trucks(id) ON DELETE SET NULL,
+  status         TEXT NOT NULL DEFAULT 'delivered',
+  notes          TEXT,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (tenant_id, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS expenses (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id    TEXT NOT NULL,
+  external_id  TEXT,
+  date         TEXT NOT NULL,              -- YYYY-MM-DD
+  truck_id     INTEGER REFERENCES trucks(id) ON DELETE SET NULL,
+  category     TEXT NOT NULL CHECK (category IN ('fuel','maintenance','insurance','tolls','other')),
+  amount_cents INTEGER NOT NULL,
+  notes        TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (tenant_id, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id  TEXT NOT NULL,
+  name       TEXT NOT NULL,
+  key_hash   TEXT NOT NULL,                -- sha256 of the key; plaintext shown once
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_loads_tenant_date ON loads(tenant_id, date);
+CREATE INDEX IF NOT EXISTS idx_loads_driver ON loads(tenant_id, driver_id);
+CREATE INDEX IF NOT EXISTS idx_expenses_tenant_date ON expenses(tenant_id, date);
+CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
+`;
+
+db.exec(SCHEMA);
+
+// ---- Seed: company, drivers, equipment (facts only — no financials) ----
+const TENANT = 'algo';
+
+function seed() {
+  const hasCompany = db.prepare('SELECT 1 FROM companies WHERE tenant_id = ?').get(TENANT);
+  if (hasCompany) return;
+
+  db.prepare(
+    'INSERT INTO companies (tenant_id, name, mc_number, usdot_number) VALUES (?,?,?,?)'
+  ).run(TENANT, 'ALGO Express LLC', 'MC-1656363', '4266729');
+
+  // Drivers — from Tree, Oct 2026. Phones unknown; pay default 30% of gross.
+  const drivers = [
+    'Trion Thomas',
+    'Jason Clark',
+    'Donte Murrill',
+    'Shdermon Hammond',
+    'Michael Parker',
+  ];
+  const insD = db.prepare(
+    'INSERT INTO drivers (tenant_id, name, pay_pct, status) VALUES (?,?,30,?)'
+  );
+  for (const name of drivers) insD.run(TENANT, name, 'active');
+
+  // Equipment — scheduled on the 10/18/2026 GEICO COI (verified VINs).
+  // NOTE: the COI spells the trailer maker "FONTEIN"; correct spelling used here.
+  const units = [
+    // year, make, model, vin, type, primary?
+    [2025, 'Freightliner', 'Cascadia', '3AKJHHDR7SSVS9058', 'tractor', 'Primary unit — 2025 Freightliner + 53\' Fontaine step deck'],
+    [2020, 'International', 'LT625', '3HSDZAPR0LN869265', 'tractor', null],
+    [2021, 'International', 'LT625', '3HSDZAPR5MN233135', 'tractor', null],
+    [2020, 'International', 'LT625', '3HSDZAPR8LN121301', 'tractor', null],
+    [2022, 'Freightliner', 'Cascadia', '3AKJHHDR7NSMY4904', 'tractor', null],
+    [2022, 'International', 'MV607', '3HAEUMML4NL457972', 'tractor', null],
+    [2021, 'International', 'LT625', '3HSDZAPR9MN104556', 'tractor', null],
+    [2022, 'Peterbilt', '579', '1XPBD49X1ND813981', 'tractor', null],
+    [2026, 'Fontaine', "53' step deck", '13N2532C3T1576257', 'trailer', 'Primary trailer — pairs with 2025 Cascadia'],
+    [2014, 'Utility', '3000R reefer', '1UYVS253XEM057418', 'trailer', null],
+  ];
+  const insT = db.prepare(
+    'INSERT INTO trucks (tenant_id, year, make, model, vin, type, notes, status) VALUES (?,?,?,?,?,?,?,?)'
+  );
+  for (const [year, make, model, vin, type, notes] of units) {
+    insT.run(TENANT, year, make, model, vin, type, notes, 'active');
+  }
+}
+seed();
+
+// ---- Query helpers ----
+function userCount(tenantId = TENANT) {
+  return db.prepare('SELECT COUNT(*) AS c FROM users WHERE tenant_id = ?').get(tenantId).c;
+}
+
+function findUserByEmail(tenantId, email) {
+  return db.prepare('SELECT * FROM users WHERE tenant_id = ? AND email = ? COLLATE NOCASE')
+    .get(tenantId, email);
+}
+
+function findUserById(id) {
+  return db.prepare(
+    `SELECT u.*, d.name AS driver_name FROM users u
+     LEFT JOIN drivers d ON d.id = u.driver_id WHERE u.id = ?`
+  ).get(id);
+}
+
+function createUser({ tenantId = TENANT, email, passwordHash, role, driverId = null }) {
+  const r = db.prepare(
+    'INSERT INTO users (tenant_id, email, password_hash, role, driver_id) VALUES (?,?,?,?,?)'
+  ).run(tenantId, email, passwordHash, role, driverId);
+  return r.lastInsertRowid;
+}
+
+function listUsers(tenantId = TENANT) {
+  return db.prepare(
+    `SELECT u.id, u.email, u.role, u.active, u.created_at, d.name AS driver_name
+     FROM users u LEFT JOIN drivers d ON d.id = u.driver_id
+     WHERE u.tenant_id = ? ORDER BY u.created_at`
+  ).all(tenantId);
+}
+
+function setUserActive(id, active) {
+  db.prepare('UPDATE users SET active = ? WHERE id = ?').run(active ? 1 : 0, id);
+}
+
+function newSessionToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function createSession(token, userId, days) {
+  const exp = new Date(Date.now() + days * 864e5).toISOString();
+  db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)')
+    .run(token, userId, exp);
+}
+
+function getSession(token) {
+  db.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')").run();
+  const s = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
+  if (!s) return null;
+  return findUserById(s.user_id);
+}
+
+function deleteSession(token) {
+  db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+}
+
+function getCompany(tenantId = TENANT) {
+  return db.prepare('SELECT * FROM companies WHERE tenant_id = ?').get(tenantId);
+}
+
+// ---- Trucks ----
+function listTrucks(tenantId = TENANT) {
+  return db.prepare('SELECT * FROM trucks WHERE tenant_id = ? ORDER BY type, year DESC').all(tenantId);
+}
+function getTruck(id, tenantId = TENANT) {
+  return db.prepare('SELECT * FROM trucks WHERE id = ? AND tenant_id = ?').get(id, tenantId);
+}
+function saveTruck(t, tenantId = TENANT) {
+  if (t.id) {
+    db.prepare(`UPDATE trucks SET unit_number=?, year=?, make=?, model=?, vin=?,
+      type=?, trailer_desc=?, status=?, notes=? WHERE id=? AND tenant_id=?`)
+      .run(t.unit_number || null, t.year || null, t.make || null, t.model || null,
+        t.vin || null, t.type || 'tractor', t.trailer_desc || null,
+        t.status || 'active', t.notes || null, t.id, tenantId);
+    return t.id;
+  }
+  const r = db.prepare(`INSERT INTO trucks
+    (tenant_id, unit_number, year, make, model, vin, type, trailer_desc, status, notes)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(tenantId, t.unit_number || null, t.year || null, t.make || null, t.model || null,
+      t.vin || null, t.type || 'tractor', t.trailer_desc || null,
+      t.status || 'active', t.notes || null);
+  return r.lastInsertRowid;
+}
+function findTruckByUnit(unitNumber, tenantId = TENANT) {
+  return db.prepare('SELECT * FROM trucks WHERE tenant_id = ? AND unit_number = ?')
+    .get(tenantId, unit_number);
+}
+
+// ---- Drivers ----
+function listDrivers(tenantId = TENANT) {
+  return db.prepare('SELECT * FROM drivers WHERE tenant_id = ? ORDER BY name').all(tenantId);
+}
+function getDriver(id, tenantId = TENANT) {
+  return db.prepare('SELECT * FROM drivers WHERE id = ? AND tenant_id = ?').get(id, tenantId);
+}
+function findDriverByName(name, tenantId = TENANT) {
+  return db.prepare('SELECT * FROM drivers WHERE tenant_id = ? AND name = ? COLLATE NOCASE')
+    .get(tenantId, name);
+}
+function saveDriver(d, tenantId = TENANT) {
+  if (d.id) {
+    db.prepare('UPDATE drivers SET name=?, phone=?, pay_pct=?, status=?, notes=? WHERE id=? AND tenant_id=?')
+      .run(d.name, d.phone || null, d.pay_pct ?? 30, d.status || 'active', d.notes || null, d.id, tenantId);
+    return d.id;
+  }
+  const r = db.prepare(
+    'INSERT INTO drivers (tenant_id, name, phone, pay_pct, status, notes) VALUES (?,?,?,?,?,?)'
+  ).run(tenantId, d.name, d.phone || null, d.pay_pct ?? 30, d.status || 'active', d.notes || null);
+  return r.lastInsertRowid;
+}
+
+// ---- Loads ----
+function listLoads(tenantId = TENANT, { driverId = null, limit = 500 } = {}) {
+  let sql = `SELECT l.*, d.name AS driver_name,
+      COALESCE(t.unit_number, t.year || ' ' || t.make || ' ' || t.model) AS truck_label
+    FROM loads l LEFT JOIN drivers d ON d.id = l.driver_id
+    LEFT JOIN trucks t ON t.id = l.truck_id
+    WHERE l.tenant_id = ?`;
+  const params = [tenantId];
+  if (driverId) { sql += ' AND l.driver_id = ?'; params.push(driverId); }
+  sql += ' ORDER BY l.date DESC, l.id DESC LIMIT ?';
+  params.push(limit);
+  return db.prepare(sql).all(...params);
+}
+function getLoad(id, tenantId = TENANT) {
+  return db.prepare('SELECT * FROM loads WHERE id = ? AND tenant_id = ?').get(id, tenantId);
+}
+function saveLoad(l, tenantId = TENANT) {
+  if (l.id) {
+    db.prepare(`UPDATE loads SET date=?, origin=?, destination=?, loaded_miles=?, empty_miles=?,
+      linehaul_cents=?, fsc_cents=?, broker=?, driver_id=?, truck_id=?, status=?, notes=?
+      WHERE id=? AND tenant_id=?`)
+      .run(l.date, l.origin || null, l.destination || null, l.loaded_miles || 0,
+        l.empty_miles || 0, l.linehaul_cents || 0, l.fsc_cents || 0, l.broker || null,
+        l.driver_id || null, l.truck_id || null, l.status || 'delivered', l.notes || null,
+        l.id, tenantId);
+    return l.id;
+  }
+  const r = db.prepare(`INSERT INTO loads
+    (tenant_id, external_id, date, origin, destination, loaded_miles, empty_miles,
+     linehaul_cents, fsc_cents, broker, driver_id, truck_id, status, notes)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(tenantId, l.external_id || null, l.date, l.origin || null, l.destination || null,
+      l.loaded_miles || 0, l.empty_miles || 0, l.linehaul_cents || 0, l.fsc_cents || 0,
+      l.broker || null, l.driver_id || null, l.truck_id || null,
+      l.status || 'delivered', l.notes || null);
+  return r.lastInsertRowid;
+}
+function upsertLoad(l, tenantId = TENANT) {
+  if (l.external_id) {
+    const ex = db.prepare('SELECT id FROM loads WHERE tenant_id = ? AND external_id = ?')
+      .get(tenantId, l.external_id);
+    if (ex) { l.id = ex.id; return { id: saveLoad(l, tenantId), updated: true }; }
+  }
+  return { id: saveLoad(l, tenantId), updated: false };
+}
+function deleteLoad(id, tenantId = TENANT) {
+  db.prepare('DELETE FROM loads WHERE id = ? AND tenant_id = ?').run(id, tenantId);
+}
+
+// ---- Expenses ----
+function listExpenses(tenantId = TENANT, { limit = 500 } = {}) {
+  return db.prepare(`SELECT e.*,
+      COALESCE(t.unit_number, t.year || ' ' || t.make || ' ' || t.model) AS truck_label
+    FROM expenses e LEFT JOIN trucks t ON t.id = e.truck_id
+    WHERE e.tenant_id = ? ORDER BY e.date DESC, e.id DESC LIMIT ?`).all(tenantId, limit);
+}
+function getExpense(id, tenantId = TENANT) {
+  return db.prepare('SELECT * FROM expenses WHERE id = ? AND tenant_id = ?').get(id, tenantId);
+}
+function saveExpense(e, tenantId = TENANT) {
+  if (e.id) {
+    db.prepare('UPDATE expenses SET date=?, truck_id=?, category=?, amount_cents=?, notes=? WHERE id=? AND tenant_id=?')
+      .run(e.date, e.truck_id || null, e.category, e.amount_cents, e.notes || null, e.id, tenantId);
+    return e.id;
+  }
+  const r = db.prepare(`INSERT INTO expenses
+    (tenant_id, external_id, date, truck_id, category, amount_cents, notes)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run(tenantId, e.external_id || null, e.date, e.truck_id || null, e.category,
+      e.amount_cents, e.notes || null);
+  return r.lastInsertRowid;
+}
+function upsertExpense(e, tenantId = TENANT) {
+  if (e.external_id) {
+    const ex = db.prepare('SELECT id FROM expenses WHERE tenant_id = ? AND external_id = ?')
+      .get(tenantId, e.external_id);
+    if (ex) { e.id = ex.id; return { id: saveExpense(e, tenantId), updated: true }; }
+  }
+  return { id: saveExpense(e, tenantId), updated: false };
+}
+function deleteExpense(id, tenantId = TENANT) {
+  db.prepare('DELETE FROM expenses WHERE id = ? AND tenant_id = ?').run(id, tenantId);
+}
+
+// ---- API keys ----
+function createApiKey(tenantId, name) {
+  const key = 'tms_' + crypto.randomBytes(24).toString('hex');
+  const hash = crypto.createHash('sha256').update(key).digest('hex');
+  db.prepare('INSERT INTO api_keys (tenant_id, name, key_hash) VALUES (?,?,?)')
+    .run(tenantId, name, hash);
+  return key; // plaintext returned ONCE
+}
+function findTenantByApiKey(key) {
+  const hash = crypto.createHash('sha256').update(key).digest('hex');
+  const row = db.prepare('SELECT tenant_id FROM api_keys WHERE key_hash = ?').get(hash);
+  return row ? row.tenant_id : null;
+}
+function listApiKeys(tenantId = TENANT) {
+  return db.prepare('SELECT id, name, created_at FROM api_keys WHERE tenant_id = ? ORDER BY id')
+    .all(tenantId);
+}
+function deleteApiKey(id, tenantId = TENANT) {
+  db.prepare('DELETE FROM api_keys WHERE id = ? AND tenant_id = ?').run(id, tenantId);
+}
+
+module.exports = {
+  TENANT,
+  db,
+  userCount, findUserByEmail, findUserById, createUser, listUsers, setUserActive,
+  newSessionToken, createSession, getSession, deleteSession,
+  getCompany,
+  listTrucks, getTruck, saveTruck, findTruckByUnit,
+  listDrivers, getDriver, findDriverByName, saveDriver,
+  listLoads, getLoad, saveLoad, upsertLoad, deleteLoad,
+  listExpenses, getExpense, saveExpense, upsertExpense, deleteExpense,
+  createApiKey, findTenantByApiKey, listApiKeys, deleteApiKey,
+};
