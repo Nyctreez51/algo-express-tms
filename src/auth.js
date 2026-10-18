@@ -65,7 +65,7 @@ function startSession(res, user) {
     httpOnly: true,
     sameSite: 'lax',
     maxAge: SESSION_DAYS * 864e5,
-    // secure: true, // enable when serving over HTTPS
+    secure: true, // HTTPS only (Railway serves TLS)
   });
 }
 
