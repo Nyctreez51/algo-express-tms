@@ -40,6 +40,28 @@ function weekRange(weekStart) {
 function monthStart(s) { return s.slice(0, 7) + '-01'; }
 function yearStart(s) { return s.slice(0, 4) + '-01-01'; }
 
+// "September 2026" from "2026-09"
+function monthLabel(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+}
+// ["2026-10", "2026-09", ...] newest first
+function recentMonths(n) {
+  const out = [];
+  const now = new Date();
+  for (let i = 0; i < n; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+  }
+  return out;
+}
+// ["2026-09-01", "2026-09-30"] from "2026-09"
+function monthRange(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  const last = new Date(y, m, 0).getDate();
+  return [`${ym}-01`, `${ym}-${String(last).padStart(2, '0')}`];
+}
+
 function fmtMoney(cents) {
   const v = (cents || 0) / 100;
   return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -67,4 +89,5 @@ function fmtWeekRange(weekStart) {
 module.exports = {
   todayStr, parseYmd, addDaysStr, weekStartOf, weekRange,
   monthStart, yearStart, fmtMoney, fmtNum, fmtDate, fmtWeekRange,
+  monthLabel, recentMonths, monthRange,
 };

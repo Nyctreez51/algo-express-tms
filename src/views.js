@@ -4,7 +4,7 @@
 
 'use strict';
 
-const { fmtMoney, fmtNum, fmtDate, fmtWeekRange } = require('./dates');
+const { fmtMoney, fmtNum, fmtDate, fmtWeekRange, monthLabel, recentMonths } = require('./dates');
 
 function esc(s) {
   return String(s == null ? '' : s)
@@ -188,11 +188,17 @@ function loginPage(q = {}) {
 
 // ---------- dashboard ----------
 function dashboardPage(user, d) {
+  const monthOpts = (d.months || recentMonths(12)).map(m =>
+    `<option value="${m}" ${m === d.monthYm ? 'selected' : ''}>${esc(monthLabel(m))}</option>`).join('');
   const cards = `
+<form method="get" action="/dashboard" class="rowflex" style="margin-bottom:12px">
+<label style="margin:0">Month</label>
+<select name="month" onchange="this.form.submit()" style="max-width:220px">${monthOpts}</select></form>
 <div class="grid">
 ${statCard('Today', fmtMoney(d.today.revenue), `${d.today.loads} loads`)}
 ${statCard('This week (Fri–Thu)', fmtMoney(d.week.revenue), `${d.week.loads} loads`)}
-${statCard('This month', fmtMoney(d.month.revenue), `${d.month.loads} loads`)}
+${statCard(monthLabel(d.monthYm), fmtMoney(d.month.revenue),
+  `${d.month.loads} loads · ${fmtNum(d.month.miles)} mi · ${fmtMoney(d.monthExpenses)} expenses`)}
 ${statCard('Year to date', fmtMoney(d.ytd.revenue), `${d.ytd.loads} loads · ${fmtNum(d.ytd.miles)} mi`)}
 </div>
 
@@ -221,8 +227,10 @@ ${d.expTrucks.map(c => `<tr><td>${esc(c.label)}</td><td class="num">${fmtMoney(c
 }
 
 // ---------- loads ----------
-function loadsPage(user, loads, drivers, trucks, q, docCounts = {}) {
+function loadsPage(user, loads, drivers, trucks, q, docCounts = {}, month = null) {
   const canE = user.role === 'owner' || user.role === 'editor';
+  const monthOpts = `<option value="">All months</option>` + recentMonths(12).map(m =>
+    `<option value="${m}" ${m === month ? 'selected' : ''}>${esc(monthLabel(m))}</option>`).join('');
   const rows = loads.map(l => {
     const gross = (l.linehaul_cents || 0) + (l.fsc_cents || 0);
     const dc = docCounts[l.id] || 0;
@@ -236,7 +244,8 @@ function loadsPage(user, loads, drivers, trucks, q, docCounts = {}) {
   return layout({
     title: 'Loads', user, active: '/loads',
     body: `${flash(q)}<div class="rowflex"><h1 style="margin:0">Loads</h1><div class="spacer"></div>
-${canE ? '<a class="btn" href="/loads/new">+ Add load</a>' : ''}</div>
+<form method="get" action="/loads" style="margin:0"><select name="month" onchange="this.form.submit()" style="max-width:180px">${monthOpts}</select></form>
+${canE ? '<a class=\"btn\" href=\"/loads/new\">+ Add load</a>' : ''}</div>
 <div class="tblwrap" style="margin-top:12px"><table>
 <tr><th>Date</th><th>Lane</th><th class="num">Miles</th><th class="num">Gross</th><th>Driver</th><th>Truck</th><th>Broker</th><th></th></tr>
 ${rows || '<tr><td colspan="8" class="mut">No loads yet.</td></tr>'}</table></div>`,
@@ -354,8 +363,12 @@ ${cats.map(c => `<option value="${c}" ${e.category === c ? 'selected' : ''}>${c}
 
 // ---------- settlements ----------
 function settlementsPage(user, weekStart, weeks, rows, q) {
-  const opts = weeks.map(w =>
-    `<option value="${w}" ${w === weekStart ? 'selected' : ''}>${esc(fmtWeekRange(w))}</option>`).join('');
+  const groups = {};
+  weeks.forEach(w => { const k = w.slice(0, 7); (groups[k] = groups[k] || []).push(w); });
+  const opts = Object.keys(groups).map(k =>
+    `<optgroup label="${esc(monthLabel(k))}">` + groups[k].map(w =>
+      `<option value="${w}" ${w === weekStart ? 'selected' : ''}>${esc(fmtWeekRange(w))}</option>`
+    ).join('') + `</optgroup>`).join('');
   const body = rows.map(r => `<tr><td>${esc(r.name)}</td><td class="num">${r.loads}</td>
 <td class="num">${fmtNum(r.miles)}</td><td class="num">${fmtMoney(r.gross)}</td>
 <td class="num">${fmtMoney(r.pay)}<div class="mut" style="font-size:11px">${esc(r.pay_basis || '')}</div></td><td class="num">${fmtMoney(r.ytd_pay)}</td>

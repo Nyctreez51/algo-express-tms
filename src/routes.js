@@ -214,13 +214,20 @@ function revenueBetween(from, to, driverId = null) {
   return db.db.prepare(sql).get(...p);
 }
 
-function dashboardData() {
+function dashboardData(monthYm) {
   const today = D.todayStr();
   const ws = D.weekStartOf(today);
   const [w0, w1] = D.weekRange(ws);
   const y0 = D.yearStart(today);
-  const m0 = D.monthStart(today);
   const ytd = revenueBetween(y0, today);
+  const months = D.recentMonths(12);
+  if (!monthYm || !/^\d{4}-\d{2}$/.test(monthYm)) monthYm = months[0];
+  const [m0, m1] = D.monthRange(monthYm);
+  const month = revenueBetween(m0, m1);
+  const monthExpenses = db.db.prepare(
+    `SELECT COALESCE(SUM(amount_cents),0) AS total FROM expenses
+     WHERE tenant_id = ? AND date >= ? AND date <= ?`
+  ).get(T(), m0, m1).total;
 
   const trucks = db.db.prepare(
     `SELECT COALESCE(t.unit_number, (t.year || ' ' || t.make || ' ' || t.model)) AS label,
@@ -256,18 +263,24 @@ function dashboardData() {
   return {
     today: revenueBetween(today, today),
     week: revenueBetween(w0, w1),
-    month: revenueBetween(m0, today),
+    month, monthYm, months, monthExpenses,
     ytd, trucks, drivers, expCats, expTrucks,
   };
 }
 
 router.get('/dashboard', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
-  res.send(v.dashboardPage(req.user, dashboardData()));
+  res.send(v.dashboardPage(req.user, dashboardData(req.query.month)));
 });
 
 // ----- loads -----
 router.get('/loads', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
-  res.send(v.loadsPage(req.user, db.listLoads(), db.listDrivers(), db.listTrucks(), req.query, docCounts(T())));
+  const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : null;
+  let loads = db.listLoads();
+  if (month) {
+    const [m0, m1] = D.monthRange(month);
+    loads = loads.filter(l => l.date >= m0 && l.date <= m1);
+  }
+  res.send(v.loadsPage(req.user, loads, db.listDrivers(), db.listTrucks(), req.query, docCounts(T()), month));
 });
 router.get('/loads/new', auth.canEdit, (req, res) => {
   res.send(v.layout({ title: 'Add load', user: req.user, active: '/loads',
