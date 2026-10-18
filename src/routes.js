@@ -12,6 +12,7 @@ const db = require('./db');
 const auth = require('./auth');
 const v = require('./views');
 const D = require('./dates');
+const { fmtNum } = require('./dates');
 
 const router = express.Router();
 
@@ -205,6 +206,7 @@ router.use(auth.requireAuth, auth.scopeGuard);
 function revenueBetween(from, to, driverId = null) {
   let sql = `SELECT COUNT(*) AS loads,
       COALESCE(SUM(loaded_miles + empty_miles),0) AS miles,
+      COALESCE(SUM(loaded_miles),0) AS loaded_miles,
       COALESCE(SUM(linehaul_cents + fsc_cents),0) AS revenue
     FROM loads WHERE tenant_id = ? AND date >= ? AND date <= ?`;
   const p = [T(), from, to];
@@ -418,22 +420,32 @@ function settlementWeek(weekStart) {
   const [w0, w1] = D.weekRange(weekStart);
   const y0 = D.yearStart(w1);
   const rows = db.db.prepare(
-    `SELECT d.id, d.name, d.pay_pct,
+    `SELECT d.id, d.name, d.pay_pct, d.pay_type, d.pay_rate,
       COUNT(l.id) AS loads,
       COALESCE(SUM(l.loaded_miles + l.empty_miles),0) AS miles,
+      COALESCE(SUM(l.loaded_miles),0) AS loaded_miles,
       COALESCE(SUM(l.linehaul_cents + l.fsc_cents),0) AS gross,
       COALESCE((SELECT SUM(l2.linehaul_cents + l2.fsc_cents) FROM loads l2
         WHERE l2.tenant_id = d.tenant_id AND l2.driver_id = d.id AND l2.date >= ?),0) AS ytd_gross,
+      COALESCE((SELECT SUM(l2.loaded_miles) FROM loads l2
+        WHERE l2.tenant_id = d.tenant_id AND l2.driver_id = d.id AND l2.date >= ?),0) AS ytd_loaded_miles,
       COALESCE((SELECT COUNT(*) FROM loads l3
         WHERE l3.tenant_id = d.tenant_id AND l3.driver_id = d.id AND l3.date >= ?),0) AS ytd_loads
     FROM drivers d LEFT JOIN loads l
       ON l.driver_id = d.id AND l.tenant_id = d.tenant_id AND l.date >= ? AND l.date <= ?
     WHERE d.tenant_id = ? AND d.status = 'active'
     GROUP BY d.id ORDER BY d.name`
-  ).all(y0, y0, w0, w1, T());
+  ).all(y0, y0, y0, w0, w1, T());
   rows.forEach(r => {
-    r.pay = Math.round(r.gross * (r.pay_pct || 0) / 100);
-    r.ytd_pay = Math.round(r.ytd_gross * (r.pay_pct || 0) / 100);
+    if (r.pay_type === 'per_mile' && Number(r.pay_rate) > 0) {
+      r.pay = Math.round(r.loaded_miles * r.pay_rate * 100);       // cents
+      r.ytd_pay = Math.round(r.ytd_loaded_miles * r.pay_rate * 100);
+      r.pay_basis = `$${Number(r.pay_rate).toFixed(2)}/mi × ${fmtNum(r.loaded_miles)} mi`;
+    } else {
+      r.pay = Math.round(r.gross * (r.pay_pct || 0) / 100);
+      r.ytd_pay = Math.round(r.ytd_gross * (r.pay_pct || 0) / 100);
+      r.pay_basis = `${r.pay_pct || 0}% of gross`;
+    }
   });
   return rows;
 }
@@ -462,6 +474,7 @@ router.get('/drivers/new', auth.canEdit, (req, res) => {
 router.post('/drivers/new', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
   const b = req.body;
   db.saveDriver({ name: b.name.trim(), phone: b.phone, pay_pct: toNum(b.pay_pct, 30),
+    pay_type: b.pay_type, pay_rate: toNum(b.pay_rate, null),
     status: b.status, notes: b.notes });
   res.redirect('/drivers?ok=Driver+added.');
 });
@@ -474,7 +487,8 @@ router.get('/drivers/:id/edit', auth.canEdit, (req, res) => {
 router.post('/drivers/:id/edit', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
   const b = req.body;
   db.saveDriver({ id: Number(req.params.id), name: b.name.trim(), phone: b.phone,
-    pay_pct: toNum(b.pay_pct, 30), status: b.status, notes: b.notes });
+    pay_pct: toNum(b.pay_pct, 30), pay_type: b.pay_type, pay_rate: toNum(b.pay_rate, null),
+    status: b.status, notes: b.notes });
   res.redirect('/drivers?ok=Driver+updated.');
 });
 
@@ -577,12 +591,16 @@ router.get('/driver/loads', auth.requireRoles('driver'), (req, res) => {
 router.get('/driver/settlements', auth.requireRoles('driver'), (req, res) => {
   if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
   const drv = db.getDriver(req.user.driver_id);
+  const perMile = drv && drv.pay_type === 'per_mile' && Number(drv.pay_rate) > 0;
   const payPct = (drv && drv.pay_pct) || 0;
   const weeks = recentWeekStarts(26).map(weekStart => {
     const [w0, w1] = D.weekRange(weekStart);
     const r = revenueBetween(w0, w1, req.user.driver_id);
-    return { weekStart, loads: r.loads, miles: r.miles, gross: r.revenue,
-      pay: Math.round(r.revenue * payPct / 100) };
+    const pay = perMile
+      ? Math.round(r.loaded_miles * drv.pay_rate * 100)
+      : Math.round(r.revenue * payPct / 100);
+    return { weekStart, loads: r.loads, miles: r.miles, gross: r.revenue, pay,
+      pay_basis: perMile ? `$${Number(drv.pay_rate).toFixed(2)}/mi` : `${payPct}%` };
   }).filter(w => w.loads > 0);
   res.send(v.driverSettlements(req.user, weeks));
 });

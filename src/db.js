@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS drivers (
   name        TEXT NOT NULL,
   phone       TEXT,
   pay_pct     REAL NOT NULL DEFAULT 30,   -- percent of gross paid to driver
+  pay_type    TEXT NOT NULL DEFAULT 'percent', -- 'percent' | 'per_mile'
+  pay_rate    REAL,                        -- dollars per loaded mile when pay_type='per_mile'
   status      TEXT NOT NULL DEFAULT 'active',
   notes       TEXT
 );
@@ -181,6 +183,25 @@ function seed() {
 }
 seed();
 
+// ---- one-time migrations for databases created before a schema change ----
+function migrate() {
+  db.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)`);
+  const cols = db.prepare(`PRAGMA table_info(drivers)`).all().map(c => c.name);
+  if (!cols.includes('pay_type')) db.exec(`ALTER TABLE drivers ADD COLUMN pay_type TEXT NOT NULL DEFAULT 'percent'`);
+  if (!cols.includes('pay_rate')) db.exec(`ALTER TABLE drivers ADD COLUMN pay_rate REAL`);
+  // Owner-confirmed driver pay terms, Oct 18 2026. Runs once; never overwrites
+  // values the owner later changes in the UI.
+  const done = db.prepare(`SELECT v FROM meta WHERE k='payterms-2026-10-18'`).get();
+  if (!done) {
+    db.prepare(`UPDATE drivers SET pay_type='per_mile', pay_rate=0.65
+      WHERE tenant_id=? AND name IN ('Donte Murrill','Shdermon Hammond')`).run(TENANT);
+    db.prepare(`UPDATE drivers SET pay_pct=35 WHERE tenant_id=? AND name='Michael Parker'`).run(TENANT);
+    db.prepare(`UPDATE drivers SET pay_pct=25 WHERE tenant_id=? AND name='Jason Clark'`).run(TENANT);
+    db.prepare(`INSERT INTO meta (k,v) VALUES ('payterms-2026-10-18','1')`).run();
+  }
+}
+migrate();
+
 // ---- Query helpers ----
 function userCount(tenantId = TENANT) {
   return db.prepare('SELECT COUNT(*) AS c FROM users WHERE tenant_id = ?').get(tenantId).c;
@@ -283,14 +304,18 @@ function findDriverByName(name, tenantId = TENANT) {
     .get(tenantId, name);
 }
 function saveDriver(d, tenantId = TENANT) {
+  const payType = d.pay_type === 'per_mile' ? 'per_mile' : 'percent';
+  const payRate = payType === 'per_mile' ? (Number(d.pay_rate) || null) : null;
   if (d.id) {
-    db.prepare('UPDATE drivers SET name=?, phone=?, pay_pct=?, status=?, notes=? WHERE id=? AND tenant_id=?')
-      .run(d.name, d.phone || null, d.pay_pct ?? 30, d.status || 'active', d.notes || null, d.id, tenantId);
+    db.prepare(`UPDATE drivers SET name=?, phone=?, pay_pct=?, pay_type=?, pay_rate=?, status=?, notes=?
+      WHERE id=? AND tenant_id=?`)
+      .run(d.name, d.phone || null, d.pay_pct ?? 30, payType, payRate,
+        d.status || 'active', d.notes || null, d.id, tenantId);
     return d.id;
   }
   const r = db.prepare(
-    'INSERT INTO drivers (tenant_id, name, phone, pay_pct, status, notes) VALUES (?,?,?,?,?,?)'
-  ).run(tenantId, d.name, d.phone || null, d.pay_pct ?? 30, d.status || 'active', d.notes || null);
+    'INSERT INTO drivers (tenant_id, name, phone, pay_pct, pay_type, pay_rate, status, notes) VALUES (?,?,?,?,?,?,?,?)'
+  ).run(tenantId, d.name, d.phone || null, d.pay_pct ?? 30, payType, payRate, d.status || 'active', d.notes || null);
   return r.lastInsertRowid;
 }
 

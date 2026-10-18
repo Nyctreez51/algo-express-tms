@@ -358,12 +358,12 @@ function settlementsPage(user, weekStart, weeks, rows, q) {
     `<option value="${w}" ${w === weekStart ? 'selected' : ''}>${esc(fmtWeekRange(w))}</option>`).join('');
   const body = rows.map(r => `<tr><td>${esc(r.name)}</td><td class="num">${r.loads}</td>
 <td class="num">${fmtNum(r.miles)}</td><td class="num">${fmtMoney(r.gross)}</td>
-<td class="num">${fmtMoney(r.pay)}</td><td class="num">${fmtMoney(r.ytd_pay)}</td>
+<td class="num">${fmtMoney(r.pay)}<div class="mut" style="font-size:11px">${esc(r.pay_basis || '')}</div></td><td class="num">${fmtMoney(r.ytd_pay)}</td>
 <td class="num">${r.ytd_loads}</td></tr>`).join('');
   return layout({
     title: 'Settlements', user, active: '/settlements',
     body: `<h1>Settlements</h1>
-<p class="mut" style="margin-bottom:10px">Settlement week runs <b>Friday → Thursday</b>. Driver pay = gross × pay %.</p>
+<p class="mut" style="margin-bottom:10px">Settlement week runs <b>Friday → Thursday</b>. Driver pay = gross × pay % <i>or</i> loaded miles × per-mile rate, per each driver's terms.</p>
 ${flash(q)}
 <form method="get" action="/settlements" class="rowflex" style="margin-bottom:12px">
 <label style="margin:0">Week</label>
@@ -376,16 +376,20 @@ ${body || '<tr><td colspan="7" class="mut">No loads this week.</td></tr>'}</tabl
 
 // ---------- drivers & trucks ----------
 function driversPage(user, drivers, q) {
-  const rows = drivers.map(d => `<tr><td>${esc(d.name)}</td><td>${esc(d.phone || '—')}</td>
-<td class="num">${d.pay_pct}%</td>
+  const rows = drivers.map(d => {
+    const payLabel = d.pay_type === 'per_mile' && Number(d.pay_rate) > 0
+      ? `$${Number(d.pay_rate).toFixed(2)}/mi` : `${d.pay_pct}%`;
+    return `<tr><td>${esc(d.name)}</td><td>${esc(d.phone || '—')}</td>
+<td class="num">${payLabel}</td>
 <td><span class="pill ${d.status === 'active' ? 'green' : ''}">${esc(d.status)}</span></td>
-<td><a class="btn small ghost" href="/drivers/${d.id}/edit">Edit</a></td></tr>`).join('');
+<td><a class="btn small ghost" href="/drivers/${d.id}/edit">Edit</a></td></tr>`;
+  }).join('');
   return layout({
     title: 'Drivers', user, active: '/drivers',
     body: `${flash(q)}<div class="rowflex"><h1 style="margin:0">Drivers</h1><div class="spacer"></div>
 <a class="btn" href="/drivers/new">+ Add driver</a></div>
 <div class="tblwrap" style="margin-top:12px"><table>
-<tr><th>Name</th><th>Phone</th><th class="num">Pay %</th><th>Status</th><th></th></tr>
+<tr><th>Name</th><th>Phone</th><th class="num">Pay</th><th>Status</th><th></th></tr>
 ${rows || '<tr><td colspan="5" class="mut">No drivers yet.</td></tr>'}</table></div>`,
   });
 }
@@ -397,7 +401,11 @@ function driverForm(d, q, isEdit) {
 <div class="row"><label>Name</label><input name="name" required value="${esc(d.name || '')}"></div>
 <div class="row"><label>Phone</label><input name="phone" value="${esc(d.phone || '')}"></div></div>
 <div class="two">
-<div class="row"><label>Pay % of gross</label><input name="pay_pct" type="number" step="0.1" min="0" max="100" value="${esc(d.pay_pct ?? 30)}"></div>
+<div class="row"><label>Pay type</label><select name="pay_type">
+${['percent', 'per_mile'].map(s => `<option value="${s}" ${d.pay_type === s ? 'selected' : ''}>${s === 'per_mile' ? 'Per mile' : '% of gross'}</option>`).join('')}</select></div>
+<div class="row"><label>Pay % of gross</label><input name="pay_pct" type="number" step="0.1" min="0" max="100" value="${esc(d.pay_pct ?? 30)}"></div></div>
+<div class="row"><label>Per-mile rate ($/loaded mi, only if pay type is Per mile)</label><input name="pay_rate" type="number" step="0.01" min="0" value="${esc(d.pay_rate ?? '')}" placeholder="0.65"></div>
+<div class="two">
 <div class="row"><label>Status</label><select name="status">
 ${['active', 'inactive'].map(s => `<option ${d.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div></div>
 <div class="row"><label>Notes</label><textarea name="notes" rows="2">${esc(d.notes || '')}</textarea></div>
@@ -540,7 +548,7 @@ ${docsTable(docs, { canManage: false, docBase: '/driver/documents' })}`;
 function driverSettlements(user, weeks) {
   const rows = weeks.map(w => `<tr><td>${esc(fmtWeekRange(w.weekStart))}</td>
 <td class="num">${w.loads}</td><td class="num">${fmtNum(w.miles)}</td>
-<td class="num">${fmtMoney(w.gross)}</td><td class="num"><b>${fmtMoney(w.pay)}</b></td></tr>`).join('');
+<td class="num">${fmtMoney(w.gross)}</td><td class="num"><b>${fmtMoney(w.pay)}</b><div class="mut" style="font-size:11px">${esc(w.pay_basis || '')}</div></td></tr>`).join('');
   return layout({
     title: 'My settlements', user, active: '/driver/settlements',
     body: `<h1>My settlements</h1>
