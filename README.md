@@ -175,3 +175,4 @@ Errors return `{"ok": false, "error": "..."}` with HTTP 400/401.
   Screen" on iPhone for an app-like feel.
 
 <!-- storage persistence verified 2026-10-18 -->
+<!-- persistence retest 2026-10-18 -->
