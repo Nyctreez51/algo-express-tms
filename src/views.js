@@ -705,4 +705,5 @@ module.exports = {
   settlementsPage, driversPage, driverForm, trucksPage, truckForm,
   usersPage, apiDocsPage,
   driverHome, driverLoads, driverLoadDetail, driverSettlements,
+  fleetPage,
 };
