@@ -649,6 +649,65 @@ router.post('/driver/position', auth.requireRoles('driver'), express.json(), (re
   res.json({ ok: !!id });
 });
 
+// ----- rate-con upload (loads not on Erica's sheet) -----
+const rateconTmp = multer.diskStorage({
+  destination(req, file, cb) {
+    const dir = path.join(UPLOAD_DIR, 'ratecon_tmp');
+    fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename(req, file, cb) {
+    const ext = ALLOWED_DOCS[file.mimetype] ||
+      ALLOWED_EXTS.find(e => e === path.extname(file.originalname).toLowerCase()) || '.bin';
+    cb(null, crypto.randomBytes(16).toString('hex') + ext);
+  },
+});
+const uploadRatecon = multer({
+  storage: rateconTmp, fileFilter: docFileFilter, limits: { fileSize: MAX_FILE_BYTES },
+});
+router.get('/ratecon', auth.requireRoles('owner', 'editor'), (req, res) => {
+  res.send(v.rateconPage(req.user, db.listDrivers(T()), req.query));
+});
+router.post('/ratecon', auth.requireRoles('owner', 'editor'),
+  uploadRatecon.single('ratecon'), (req, res) => {
+  const b = req.body || {};
+  const loadNumber = String(b.load_number || '').trim();
+  if (!loadNumber) return res.redirect('/ratecon?err=Load+number+is+required.');
+  const loadedMiles = Number(b.loaded_miles) || 0;
+  let linehaulC = toCents(b.linehaul);
+  let fscC = b.fsc === '' || b.fsc == null ? null : toCents(b.fsc);
+  // 65c fallback: blank FSC + miles + a stated total -> carve FSC out of the total.
+  if (fscC == null && loadedMiles > 0 && linehaulC > 0) {
+    fscC = Math.min(Math.round(loadedMiles * 0.65 * 100), linehaulC);
+    linehaulC -= fscC;
+  }
+  const r = db.upsertLoad({
+    external_id: 'load-' + loadNumber,
+    date: b.date || D.todayStr(),
+    origin: b.origin || null, destination: b.destination || null,
+    loaded_miles: loadedMiles, empty_miles: Number(b.empty_miles) || 0,
+    linehaul_cents: linehaulC, fsc_cents: fscC || 0,
+    broker: b.broker || null,
+    driver_id: b.driver_id ? Number(b.driver_id) : null,
+    status: b.status || 'booked',
+    notes: b.delivery_date ? ('Deliver ' + b.delivery_date) : null,
+  }, T());
+  if (req.file) {
+    const dir = path.join(UPLOAD_DIR, 'load_' + r.id);
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, path.basename(req.file.path));
+    fs.renameSync(req.file.path, dest);
+    db.createDocument({
+      load_id: r.id, doc_type: 'ratecon',
+      original_name: req.file.originalname,
+      stored_path: path.join('load_' + r.id, path.basename(dest)),
+      mime: req.file.mimetype, size_bytes: req.file.size,
+      uploaded_by: req.user.email,
+    }, T());
+  }
+  res.redirect('/loads/' + r.id + (r.updated ? '?ok=Load+updated+with+rate+con.' : '?ok=Load+created+from+rate+con.'));
+});
+
 // ----- fleet map (owner/editor) -----
 router.get('/fleet', auth.requireRoles('owner', 'editor'), (req, res) => {
   res.send(v.fleetPage(req.user));

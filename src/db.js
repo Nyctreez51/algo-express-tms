@@ -91,6 +91,31 @@ CREATE TABLE IF NOT EXISTS loads (
   UNIQUE (tenant_id, external_id)
 );
 
+-- Live trip tracking (driver phone GPS; Path 1: web-based, while page is open).
+CREATE TABLE IF NOT EXISTS trips (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id  TEXT NOT NULL,
+  driver_id  INTEGER NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+  load_id    INTEGER REFERENCES loads(id) ON DELETE SET NULL,
+  started_at TEXT NOT NULL DEFAULT (datetime('now')),
+  ended_at   TEXT,                       -- NULL = trip currently active
+  start_lat  REAL, start_lon REAL,
+  end_lat    REAL, end_lon REAL
+);
+CREATE TABLE IF NOT EXISTS positions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id   TEXT NOT NULL,
+  trip_id     INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+  lat         REAL NOT NULL,
+  lon         REAL NOT NULL,
+  accuracy    REAL,                       -- meters, as reported by the phone
+  speed       REAL,                       -- mph (converted from m/s at ingest)
+  heading     REAL,                       -- degrees, as reported by the phone
+  recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips(tenant_id, driver_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_positions_trip ON positions(tenant_id, trip_id, recorded_at);
+
 CREATE TABLE IF NOT EXISTS expenses (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id    TEXT NOT NULL,
@@ -189,6 +214,10 @@ function migrate() {
   const cols = db.prepare(`PRAGMA table_info(drivers)`).all().map(c => c.name);
   if (!cols.includes('pay_type')) db.exec(`ALTER TABLE drivers ADD COLUMN pay_type TEXT NOT NULL DEFAULT 'percent'`);
   if (!cols.includes('pay_rate')) db.exec(`ALTER TABLE drivers ADD COLUMN pay_rate REAL`);
+  // IFTA fuel fields on expenses (gallons + purchase state).
+  const ecols = db.prepare(`PRAGMA table_info(expenses)`).all().map(c => c.name);
+  if (!ecols.includes('gallons')) db.exec(`ALTER TABLE expenses ADD COLUMN gallons REAL`);
+  if (!ecols.includes('fuel_state')) db.exec(`ALTER TABLE expenses ADD COLUMN fuel_state TEXT`);
   // Owner-confirmed driver pay terms, Oct 18 2026. Runs once; never overwrites
   // values the owner later changes in the UI.
   const done = db.prepare(`SELECT v FROM meta WHERE k='payterms-2026-10-18'`).get();
@@ -379,17 +408,77 @@ function getExpense(id, tenantId = TENANT) {
   return db.prepare('SELECT * FROM expenses WHERE id = ? AND tenant_id = ?').get(id, tenantId);
 }
 function saveExpense(e, tenantId = TENANT) {
+  const gallons = e.gallons != null && Number.isFinite(Number(e.gallons)) ? Number(e.gallons) : null;
+  const fuelState = e.fuel_state ? String(e.fuel_state).toUpperCase().slice(0, 2) : null;
   if (e.id) {
-    db.prepare('UPDATE expenses SET date=?, truck_id=?, category=?, amount_cents=?, notes=? WHERE id=? AND tenant_id=?')
-      .run(e.date, e.truck_id || null, e.category, e.amount_cents, e.notes || null, e.id, tenantId);
+    db.prepare(`UPDATE expenses SET date=?, truck_id=?, category=?, amount_cents=?, notes=?,
+      gallons=?, fuel_state=? WHERE id=? AND tenant_id=?`)
+      .run(e.date, e.truck_id || null, e.category, e.amount_cents, e.notes || null,
+        gallons, fuelState, e.id, tenantId);
     return e.id;
   }
   const r = db.prepare(`INSERT INTO expenses
-    (tenant_id, external_id, date, truck_id, category, amount_cents, notes)
-    VALUES (?,?,?,?,?,?,?)`)
+    (tenant_id, external_id, date, truck_id, category, amount_cents, notes, gallons, fuel_state)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
     .run(tenantId, e.external_id || null, e.date, e.truck_id || null, e.category,
-      e.amount_cents, e.notes || null);
+      e.amount_cents, e.notes || null, gallons, fuelState);
   return r.lastInsertRowid;
+}
+
+// ---------- live trip tracking ----------
+function activeTrip(driverId, tenantId = TENANT) {
+  return db.prepare(`SELECT t.*, d.name AS driver_name,
+      (SELECT COUNT(*) FROM positions p WHERE p.trip_id = t.id AND p.tenant_id = t.tenant_id) AS fixes
+    FROM trips t JOIN drivers d ON d.id = t.driver_id
+    WHERE t.tenant_id = ? AND t.driver_id = ? AND t.ended_at IS NULL
+    ORDER BY t.started_at DESC LIMIT 1`).get(tenantId, driverId);
+}
+function startTrip(driverId, loadId, tenantId = TENANT) {
+  db.prepare(`UPDATE trips SET ended_at = datetime('now')
+    WHERE tenant_id = ? AND driver_id = ? AND ended_at IS NULL`).run(tenantId, driverId);
+  const r = db.prepare(`INSERT INTO trips (tenant_id, driver_id, load_id) VALUES (?,?,?)`)
+    .run(tenantId, driverId, loadId || null);
+  return r.lastInsertRowid;
+}
+function endTrip(driverId, tenantId = TENANT) {
+  const t = activeTrip(driverId, tenantId);
+  if (!t) return null;
+  db.prepare(`UPDATE trips SET ended_at = datetime('now') WHERE id = ? AND tenant_id = ?`)
+    .run(t.id, tenantId);
+  return t.id;
+}
+function addPosition(driverId, pos, tenantId = TENANT) {
+  const t = activeTrip(driverId, tenantId);
+  if (!t) return null;
+  const lat = Number(pos.lat), lon = Number(pos.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+  db.prepare(`INSERT INTO positions
+    (tenant_id, trip_id, lat, lon, accuracy, speed, heading) VALUES (?,?,?,?,?,?,?)`)
+    .run(tenantId, t.id, lat, lon,
+      pos.accuracy != null ? Number(pos.accuracy) : null,
+      pos.speed != null ? Number(pos.speed) : null,
+      pos.heading != null ? Number(pos.heading) : null);
+  if (t.fixes === 0) {
+    db.prepare(`UPDATE trips SET start_lat = ?, start_lon = ? WHERE id = ?`).run(lat, lon, t.id);
+  }
+  return t.id;
+}
+// Active trips with latest fix — for the owner's fleet map.
+function fleetSnapshot(tenantId = TENANT) {
+  return db.prepare(
+    `SELECT t.id AS trip_id, t.driver_id, d.name AS driver_name, t.load_id,
+      l.origin, l.destination, t.started_at,
+      p.lat, p.lon, p.speed, p.recorded_at,
+      (SELECT COUNT(*) FROM positions WHERE trip_id = t.id) AS fixes
+    FROM trips t
+    JOIN drivers d ON d.id = t.driver_id
+    LEFT JOIN loads l ON l.id = t.load_id
+    LEFT JOIN positions p ON p.id = (
+      SELECT id FROM positions WHERE trip_id = t.id AND tenant_id = t.tenant_id
+      ORDER BY recorded_at DESC LIMIT 1)
+    WHERE t.tenant_id = ? AND t.ended_at IS NULL
+    ORDER BY d.name`).all(tenantId);
 }
 function upsertExpense(e, tenantId = TENANT) {
   if (e.external_id) {
@@ -461,4 +550,5 @@ module.exports = {
   listExpenses, getExpense, saveExpense, upsertExpense, deleteExpense,
   listDocumentsByLoad, getDocument, createDocument, deleteDocument,
   createApiKey, findTenantByApiKey, listApiKeys, deleteApiKey,
+  activeTrip, startTrip, endTrip, addPosition, fleetSnapshot,
 };
