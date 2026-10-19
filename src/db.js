@@ -331,7 +331,7 @@ function saveTruck(t, tenantId = TENANT) {
 }
 function findTruckByUnit(unitNumber, tenantId = TENANT) {
   return db.prepare('SELECT * FROM trucks WHERE tenant_id = ? AND unit_number = ?')
-    .get(tenantId, unit_number);
+    .get(tenantId, unitNumber);
 }
 
 // ---- Drivers ----
