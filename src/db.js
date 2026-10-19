@@ -152,6 +152,19 @@ CREATE TABLE IF NOT EXISTS documents (
 
 CREATE INDEX IF NOT EXISTS idx_documents_load ON documents(tenant_id, load_id);
 
+-- driver escrow ledger: +withholding builds the balance, -deduction/-release draw it down
+CREATE TABLE IF NOT EXISTS escrow_entries (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id    TEXT NOT NULL,
+  driver_id    INTEGER NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+  date         TEXT NOT NULL,              -- YYYY-MM-DD
+  amount_cents INTEGER NOT NULL,           -- +withholding, -deduction/release
+  entry_type   TEXT NOT NULL CHECK (entry_type IN ('withholding','deduction','release','adjustment')),
+  notes        TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_escrow_driver ON escrow_entries(tenant_id, driver_id, date);
+
 CREATE INDEX IF NOT EXISTS idx_loads_tenant_date ON loads(tenant_id, date);
 CREATE INDEX IF NOT EXISTS idx_loads_driver ON loads(tenant_id, driver_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_tenant_date ON expenses(tenant_id, date);
@@ -492,6 +505,30 @@ function deleteExpense(id, tenantId = TENANT) {
   db.prepare('DELETE FROM expenses WHERE id = ? AND tenant_id = ?').run(id, tenantId);
 }
 
+// ---- Driver escrow ledger ----
+function createEscrowEntry(e, tenantId = TENANT) {
+  const r = db.prepare(`INSERT INTO escrow_entries
+    (tenant_id, driver_id, date, amount_cents, entry_type, notes)
+    VALUES (?,?,?,?,?,?)`)
+    .run(tenantId, e.driver_id, e.date, e.amount_cents, e.entry_type, e.notes || null);
+  return r.lastInsertRowid;
+}
+function listEscrowEntries(driverId, tenantId = TENANT) {
+  return db.prepare(`SELECT * FROM escrow_entries
+    WHERE tenant_id = ? AND driver_id = ? ORDER BY date DESC, id DESC`).all(tenantId, driverId);
+}
+function escrowBalance(driverId, tenantId = TENANT) {
+  const r = db.prepare(`SELECT COALESCE(SUM(amount_cents),0) AS bal FROM escrow_entries
+    WHERE tenant_id = ? AND driver_id = ?`).get(tenantId, driverId);
+  return r.bal;
+}
+function escrowWithheld(driverId, w0, w1, tenantId = TENANT) {
+  const r = db.prepare(`SELECT COALESCE(SUM(amount_cents),0) AS amt FROM escrow_entries
+    WHERE tenant_id = ? AND driver_id = ? AND date >= ? AND date <= ?
+    AND entry_type = 'withholding'`).get(tenantId, driverId, w0, w1);
+  return r.amt;
+}
+
 // ---- Documents (rate confirmations + PODs attached to loads) ----
 function listDocumentsByLoad(loadId, tenantId = TENANT) {
   return db.prepare(`SELECT d.*, u.email AS uploaded_by_email
@@ -548,6 +585,7 @@ module.exports = {
   listDrivers, getDriver, findDriverByName, saveDriver,
   listLoads, getLoad, saveLoad, upsertLoad, deleteLoad,
   listExpenses, getExpense, saveExpense, upsertExpense, deleteExpense,
+  createEscrowEntry, listEscrowEntries, escrowBalance, escrowWithheld,
   listDocumentsByLoad, getDocument, createDocument, deleteDocument,
   createApiKey, findTenantByApiKey, listApiKeys, deleteApiKey,
   activeTrip, startTrip, endTrip, addPosition, fleetSnapshot,

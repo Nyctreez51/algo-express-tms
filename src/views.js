@@ -4,7 +4,7 @@
 
 'use strict';
 
-const { fmtMoney, fmtNum, fmtDate, fmtWeekRange, monthLabel, recentMonths } = require('./dates');
+const { fmtMoney, fmtNum, fmtDate, fmtWeekRange, monthLabel, recentMonths, todayStr } = require('./dates');
 
 function esc(s) {
   return String(s == null ? '' : s)
@@ -377,7 +377,8 @@ function settlementsPage(user, weekStart, weeks, rows, q) {
   const body = rows.map(r => `<tr><td>${esc(r.name)}</td><td class="num">${r.loads}</td>
 <td class="num">${fmtNum(r.miles)}</td><td class="num">${fmtMoney(r.gross)}</td>
 <td class="num">${fmtMoney(r.pay)}<div class="mut" style="font-size:11px">${esc(r.pay_basis || '')}</div></td><td class="num">${fmtMoney(r.ytd_pay)}</td>
-<td class="num">${r.ytd_loads}</td></tr>`).join('');
+<td class="num">${fmtMoney(r.ytd_loads)}</td>
+<td class="num">${r.escrow_withheld ? fmtMoney(r.escrow_withheld) : '—'}<div class="mut" style="font-size:11px">bal ${fmtMoney(r.escrow_balance || 0)}</div></td></tr>`).join('');
   return layout({
     title: 'Settlements', user, active: '/settlements',
     body: `<h1>Settlements</h1>
@@ -387,8 +388,12 @@ ${flash(q)}
 <label style="margin:0">Week</label>
 <select name="week" onchange="this.form.submit()" style="max-width:320px">${opts}</select></form>
 <div class="tblwrap"><table>
-<tr><th>Driver</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">Pay</th><th class="num">YTD pay</th><th class="num">YTD loads</th></tr>
-${body || '<tr><td colspan="7" class="mut">No loads this week.</td></tr>'}</table></div>`,
+<tr><th>Driver</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">Pay</th><th class="num">YTD pay</th><th class="num">YTD loads</th><th class="num">Escrow</th></tr>
+${body || '<tr><td colspan="8" class="mut">No loads this week.</td></tr>'}</table></div>
+<form method="post" action="/escrow/withhold-weekly" style="margin-top:12px" class="rowflex">
+<label style="margin:0">Record <b>$100</b> escrow withholding for all active drivers</label>
+<input type="date" name="date" value="${esc(todayStr())}" style="max-width:170px">
+<button class="btn small">Withhold $100 each</button></form>`,
   });
 }
 
@@ -400,15 +405,50 @@ function driversPage(user, drivers, q) {
     return `<tr><td>${esc(d.name)}</td><td>${esc(d.phone || '—')}</td>
 <td class="num">${payLabel}</td>
 <td><span class="pill ${d.status === 'active' ? 'green' : ''}">${esc(d.status)}</span></td>
-<td><a class="btn small ghost" href="/drivers/${d.id}/edit">Edit</a></td></tr>`;
+<td class="num">${d.escrow_balance ? fmtMoney(d.escrow_balance) : '—'}</td>
+<td><a class="btn small ghost" href="/drivers/${d.id}/escrow">Escrow</a>
+<a class="btn small ghost" href="/drivers/${d.id}/edit">Edit</a></td></tr>`;
   }).join('');
   return layout({
     title: 'Drivers', user, active: '/drivers',
     body: `${flash(q)}<div class="rowflex"><h1 style="margin:0">Drivers</h1><div class="spacer"></div>
 <a class="btn" href="/drivers/new">+ Add driver</a></div>
 <div class="tblwrap" style="margin-top:12px"><table>
-<tr><th>Name</th><th>Phone</th><th class="num">Pay</th><th>Status</th><th></th></tr>
-${rows || '<tr><td colspan="5" class="mut">No drivers yet.</td></tr>'}</table></div>`,
+<tr><th>Name</th><th>Phone</th><th class="num">Pay</th><th>Status</th><th class="num">Escrow bal</th><th></th></tr>
+${rows || '<tr><td colspan="6" class="mut">No drivers yet.</td></tr>'}</table></div>`,
+  });
+}
+
+// ---------- driver escrow ledger ----------
+function escrowPage(user, d, entries, balance, q) {
+  const typeLabel = { withholding: 'Withholding', deduction: 'Deduction', release: 'Release', adjustment: 'Adjustment' };
+  const rows = entries.map(e => {
+    const amt = e.amount_cents >= 0 ? fmtMoney(e.amount_cents) : '−' + fmtMoney(-e.amount_cents);
+    const cls = e.amount_cents >= 0 ? 'num' : 'num" style="color:var(--danger)';
+    return `<tr><td>${esc(fmtDate(e.date))}</td><td>${esc(typeLabel[e.entry_type] || e.entry_type)}</td>
+<td class="${cls}">${amt}</td><td>${esc(e.notes || '—')}</td></tr>`;
+  }).join('');
+  return layout({
+    title: `Escrow — ${d.name}`, user, active: '/drivers',
+    body: `<h1>Escrow — ${esc(d.name)}</h1>${flash(q)}
+<p style="margin-bottom:12px;font-size:20px">Balance: <b>${fmtMoney(balance)}</b></p>
+<div class="tblwrap"><table>
+<tr><th>Date</th><th>Type</th><th class="num">Amount</th><th>Notes</th></tr>
+${rows || '<tr><td colspan="4" class="mut">No escrow entries yet.</td></tr>'}</table></div>
+<h2 style="margin-top:18px">Record entry</h2>
+<form class="f card" method="post" action="/drivers/${d.id}/escrow">
+<div class="two">
+<div class="row"><label>Date</label><input type="date" name="date" value="${esc(todayStr())}"></div>
+<div class="row"><label>Type</label><select name="entry_type">
+<option value="withholding">Withholding (adds $)</option>
+<option value="deduction">Deduction (takes $)</option>
+<option value="release">Release (payout $)</option>
+<option value="adjustment">Adjustment (adds $)</option>
+</select></div></div>
+<div class="row"><label>Amount ($)</label><input name="amount" type="number" step="0.01" min="0.01" required placeholder="100.00"></div>
+<div class="row"><label>Notes</label><input name="notes" placeholder="e.g. weekly withholding, tire damage"></div>
+<button class="btn">Record entry</button>
+<a class="btn ghost" href="/drivers" style="margin-left:8px">Back</a></form>`,
   });
 }
 
@@ -596,17 +636,20 @@ ${docsTable(docs, { canManage: false, docBase: '/driver/documents' })}`;
   return layout({ title: 'Load detail', user, active: '/driver/loads', body });
 }
 
-function driverSettlements(user, weeks) {
+function driverSettlements(user, weeks, escrowBalance) {
   const rows = weeks.map(w => `<tr><td>${esc(fmtWeekRange(w.weekStart))}</td>
 <td class="num">${w.loads}</td><td class="num">${fmtNum(w.miles)}</td>
-<td class="num">${fmtMoney(w.gross)}</td><td class="num"><b>${fmtMoney(w.pay)}</b><div class="mut" style="font-size:11px">${esc(w.pay_basis || '')}</div></td></tr>`).join('');
+<td class="num">${fmtMoney(w.gross)}</td><td class="num"><b>${fmtMoney(w.pay)}</b><div class="mut" style="font-size:11px">${esc(w.pay_basis || '')}</div></td>
+<td class="num">${w.escrow_withheld ? fmtMoney(w.escrow_withheld) : '—'}</td></tr>`).join('');
+  const balLine = escrowBalance ? `<p style="margin-bottom:10px"><b>Escrow balance: ${fmtMoney(escrowBalance)}</b> <span class="mut">($100/week withholding)</span></p>` : '';
   return layout({
     title: 'My settlements', user, active: '/driver/settlements',
     body: `<h1>My settlements</h1>
 <p class="mut" style="margin-bottom:10px">Settlement week runs <b>Friday → Thursday</b>.</p>
+${balLine}
 <div class="tblwrap"><table>
-<tr><th>Week</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">Pay</th></tr>
-${rows || '<tr><td colspan="5" class="mut">No settlements yet.</td></tr>'}</table></div>`,
+<tr><th>Week</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">Pay</th><th class="num">Escrow held</th></tr>
+${rows || '<tr><td colspan="6" class="mut">No settlements yet.</td></tr>'}</table></div>`,
   });
 }
 
@@ -739,7 +782,7 @@ module.exports = {
   setupPage, loginPage,
   dashboardPage, loadsPage, loadForm, loadDetailPage,
   expensesPage, expenseForm,
-  settlementsPage, driversPage, driverForm, trucksPage, truckForm,
+  settlementsPage, driversPage, driverForm, escrowPage, trucksPage, truckForm,
   usersPage, apiDocsPage,
   driverHome, driverLoads, driverLoadDetail, driverSettlements,
   fleetPage, rateconPage,

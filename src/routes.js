@@ -463,6 +463,8 @@ function settlementWeek(weekStart) {
       r.ytd_pay = Math.round(r.ytd_gross * (r.pay_pct || 0) / 100);
       r.pay_basis = `${r.pay_pct || 0}% of gross`;
     }
+    r.escrow_withheld = db.escrowWithheld(r.id, w0, w1, T());
+    r.escrow_balance = db.escrowBalance(r.id, T());
   });
   return rows;
 }
@@ -482,7 +484,8 @@ router.get('/settlements', auth.requireRoles('owner', 'editor', 'viewer'), (req,
 
 // ----- drivers -----
 router.get('/drivers', auth.canEdit, (req, res) => {
-  res.send(v.driversPage(req.user, db.listDrivers(), req.query));
+  const drivers = db.listDrivers().map(d => ({ ...d, escrow_balance: db.escrowBalance(d.id) }));
+  res.send(v.driversPage(req.user, drivers, req.query));
 });
 router.get('/drivers/new', auth.canEdit, (req, res) => {
   res.send(v.layout({ title: 'Add driver', user: req.user, active: '/drivers',
@@ -507,6 +510,38 @@ router.post('/drivers/:id/edit', auth.canEdit, express.urlencoded({ extended: fa
     pay_pct: toNum(b.pay_pct, 30), pay_type: b.pay_type, pay_rate: toNum(b.pay_rate, null),
     status: b.status, notes: b.notes });
   res.redirect('/drivers?ok=Driver+updated.');
+});
+
+// ----- driver escrow ledger -----
+router.get('/drivers/:id/escrow', auth.canEdit, (req, res) => {
+  const d = db.getDriver(Number(req.params.id));
+  if (!d) return res.status(404).send('Driver not found');
+  res.send(v.escrowPage(req.user, d, db.listEscrowEntries(d.id), db.escrowBalance(d.id), req.query));
+});
+router.post('/drivers/:id/escrow', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const id = Number(req.params.id);
+  const d = db.getDriver(id);
+  if (!d) return res.status(404).send('Driver not found');
+  const b = req.body;
+  const type = ['withholding', 'deduction', 'release', 'adjustment'].includes(b.entry_type) ? b.entry_type : 'withholding';
+  let cents = Math.round(Number(b.amount) * 100);
+  if (!Number.isFinite(cents) || cents <= 0) return res.redirect(`/drivers/${id}/escrow?err=Enter+a+positive+amount.`);
+  if (type === 'deduction' || type === 'release') cents = -cents;   // draw the balance down
+  db.createEscrowEntry({ driver_id: id, date: b.date || D.todayStr(), amount_cents: cents,
+    entry_type: type, notes: (b.notes || '').trim() || null });
+  res.redirect(`/drivers/${id}/escrow?ok=Escrow+entry+recorded.`);
+});
+// one-click $100 weekly withholding for every active driver
+router.post('/escrow/withhold-weekly', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const date = req.body.date || D.todayStr();
+  const drivers = db.listDrivers().filter(d => d.status === 'active');
+  let n = 0;
+  for (const d of drivers) {
+    db.createEscrowEntry({ driver_id: d.id, date, amount_cents: 10000,
+      entry_type: 'withholding', notes: 'Weekly $100 escrow withholding' });
+    n++;
+  }
+  res.redirect(`/settlements?ok=${n}+drivers+withheld+$100+escrow.`);
 });
 
 // ----- trucks -----
@@ -621,9 +656,11 @@ router.get('/driver/settlements', auth.requireRoles('driver'), (req, res) => {
       ? Math.round(r.loaded_miles * drv.pay_rate * 100)
       : Math.round(r.revenue * payPct / 100);
     return { weekStart, loads: r.loads, miles: r.miles, gross: r.revenue, pay,
-      pay_basis: perMile ? `$${Number(drv.pay_rate).toFixed(2)}/mi` : `${payPct}%` };
+      pay_basis: perMile ? `$${Number(drv.pay_rate).toFixed(2)}/mi` : `${payPct}%`,
+      escrow_withheld: db.escrowWithheld(req.user.driver_id, w0, w1) };
   }).filter(w => w.loads > 0);
-  res.send(v.driverSettlements(req.user, weeks));
+  const escrow_balance = db.escrowBalance(req.user.driver_id);
+  res.send(v.driverSettlements(req.user, weeks, escrow_balance));
 });
 
 // ----- live trip tracking (driver phone GPS) -----
