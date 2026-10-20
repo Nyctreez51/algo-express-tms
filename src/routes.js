@@ -753,6 +753,76 @@ router.get('/fleet/data', auth.requireRoles('owner', 'editor'), (req, res) => {
   res.json({ ok: true, trips: db.fleetSnapshot(T()) });
 });
 
+// ----- fuel discounts (RXO feed): best stops near a location -----
+router.get('/fuel/near', (req, res) => {
+  if (!req.user) return res.status(401).json({ ok: false, error: 'Not signed in.' });
+  const lat = Number(req.query.lat), lon = Number(req.query.lon);
+  const radius = Math.min(Math.max(Number(req.query.radius) || 60, 5), 150);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+    return res.status(400).json({ ok: false, error: 'Bad coordinates.' });
+  }
+  const info = db.fuelFeedInfo(T());
+  if (!info.count) return res.json({ ok: true, feed_date: null, stops: [] });
+  const stops = db.nearestFuelStops(lat, lon, radius, 5, T());
+  res.json({ ok: true, feed_date: info.feed_date, stops });
+});
+
+router.get('/fuel', auth.requireRoles('owner', 'editor'), (req, res) => {
+  const info = db.fuelFeedInfo(T());
+  const trucks = db.fleetSnapshot(T())
+    .filter(t => t.lat != null && t.lon != null)
+    .map(t => ({ ...t, stops: db.nearestFuelStops(t.lat, t.lon, 60, 3, T()) }));
+  res.send(v.fuelPage(req.user, info, trucks, req.query));
+});
+
+const fuelUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+router.post('/fuel/upload', auth.requireRoles('owner', 'editor'), fuelUpload.single('feed'), (req, res) => {
+  if (!req.file) return res.redirect('/fuel?err=' + encodeURIComponent('No file chosen.'));
+  let XLSX;
+  try { XLSX = require('xlsx'); } catch (e) {
+    return res.redirect('/fuel?err=' + encodeURIComponent('Spreadsheet parser unavailable on the server.'));
+  }
+  let rows;
+  try {
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+  } catch (e) {
+    return res.redirect('/fuel?err=' + encodeURIComponent('Could not read that spreadsheet.'));
+  }
+  const { geocodeCity } = require('./geocode');
+  const stops = [];
+  let feedDate = null, skipped = 0;
+  for (const r of rows) {
+    const name = String(r.TSName || r.Name || '').trim();
+    const city = String(r.City || '').trim();
+    const state = String(r.State || '').trim().toUpperCase();
+    const pump = Number(r.PumpPrice), price = Number(r.CustomerPrice);
+    if (!name || !state || !Number.isFinite(pump) || !Number.isFinite(price)) { skipped++; continue; }
+    const ll = geocodeCity(city, state);
+    if (!ll) { skipped++; continue; }
+    const sav = Number(r.Savings);
+    stops.push({
+      name, location: String(r.Location || '').trim(), city, state,
+      pump, price, savings: Number.isFinite(sav) ? sav : Math.round((pump - price) * 10000) / 10000,
+      lat: ll[0], lon: ll[1],
+    });
+    let d = null;
+    if (r.Date instanceof Date && !isNaN(r.Date)) d = r.Date;
+    else if (Number.isFinite(Number(r.Date)) && Number(r.Date) > 20000) {
+      d = new Date(Date.UTC(1899, 11, 30) + Number(r.Date) * 86400000); // Excel serial
+    }
+    if (d) feedDate = d.toISOString().slice(0, 10);
+  }
+  if (!stops.length) {
+    return res.redirect('/fuel?err=' + encodeURIComponent('No usable stops found in that file — nothing was changed.'));
+  }
+  if (!feedDate) feedDate = new Date().toISOString().slice(0, 10);
+  const n = db.replaceFuelStops(stops, feedDate, 'RXO price feed (uploaded)', T());
+  res.redirect('/fuel?ok=' + encodeURIComponent(
+    `Fuel feed updated: ${n} stops priced as of ${feedDate}${skipped ? ` (${skipped} rows skipped — unrecognized place or bad data)` : ''}.`));
+});
+
 // Driver load detail — own loads only, with their documents.
 router.get('/driver/loads/:id', auth.requireRoles('driver'), (req, res) => {
   if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');

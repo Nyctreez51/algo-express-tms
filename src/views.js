@@ -79,6 +79,7 @@ function navFor(user) {
   if (r === 'driver') return ''; // drivers use the bottom tab bar
   let links = link('/dashboard', 'Dashboard', '/dashboard')
     + link('/fleet', 'Fleet map', '/fleet')
+    + link('/fuel', 'Fuel', '/fuel')
     + link('/ratecon', 'Rate con', '/ratecon')
     + link('/loads', 'Loads', '/loads')
     + link('/expenses', 'Expenses', '/expenses')
@@ -581,10 +582,47 @@ navigator.geolocation.watchPosition(send,
 <form method="post" action="/driver/trip/start"><div class="row">
 <label>Load (optional)</label><select name="load_id"><option value="">Just driving / positioning</option>${loadOpts}</select></div>
 <button class="btn">Start trip</button></form></div>`;
+  const fuelCard = `
+<div class="card" style="margin-bottom:12px">
+<p style="margin:0 0 6px"><b>⛽ Best fuel near you</b> <span class="mut">(RXO discounts)</span></p>
+<div id="fuelbox"><p class="mut" style="margin:0">Finding stops…</p></div>
+</div>
+<script>(function(){
+var box=document.getElementById('fuelbox');
+function money(x){return '$'+Number(x).toFixed(2);}
+function escHtml(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function render(j){
+  if(!j.ok){box.innerHTML='<p class="mut" style="margin:0">Fuel prices unavailable right now.</p>';return;}
+  if(!j.stops||!j.stops.length){box.innerHTML='<p class="mut" style="margin:0">No discount stops within 60 miles of you in the current feed.</p>';return;}
+  var h='<p class="mut" style="margin:0 0 8px">Prices as of '+j.feed_date+' · best value first (price + distance)</p>';
+  j.stops.forEach(function(s,i){
+    var q=encodeURIComponent(s.name+' '+s.city+' '+s.state);
+    h+='<div style="padding:8px 0;border-top:1px solid #2a2f3a">'
+      +'<div style="display:flex;justify-content:space-between;align-items:baseline">'
+      +'<b>'+(i===0?'⭐ ':'')+escHtml(s.name)+'</b><span style="font-size:18px"><b>'+money(s.cust_price)+'</b>/gal</span></div>'
+      +'<div class="mut">'+escHtml(s.city)+', '+escHtml(s.state)+' · ~'+s.distance_mi+' mi away · pump '+money(s.pump_price)
+      +' · <span style="color:#4ade80">save '+money(s.savings)+'/gal</span></div>'
+      +(s.location?'<div class="mut">'+escHtml(s.location)+'</div>':'')
+      +'<div style="margin-top:4px"><a href="https://www.google.com/maps/search/?api=1&query='+q+'" target="_blank" rel="noopener">Open in Maps →</a></div></div>';
+  });
+  box.innerHTML=h;
+}
+function go(){
+  if(!navigator.geolocation){box.innerHTML='<p class="mut" style="margin:0">Location not supported on this device.</p>';return;}
+  navigator.geolocation.getCurrentPosition(function(pos){
+    fetch('/fuel/near?lat='+pos.coords.latitude+'&lon='+pos.coords.longitude)
+      .then(function(r){return r.json();}).then(render)
+      .catch(function(){box.innerHTML='<p class="mut" style="margin:0">Could not load fuel prices — check connection.</p>';});
+  },function(){box.innerHTML='<p class="mut" style="margin:0">Allow location access to see the best fuel near you.</p>';},
+  {enableHighAccuracy:true,maximumAge:60000,timeout:15000});
+}
+go();
+})();</script>`;
   const body = `
 <h1 style="font-size:20px">Hi, ${esc(user.driver_name || 'driver')} 👋</h1>
 <p class="mut" style="margin-bottom:12px">Week of ${esc(fmtWeekRange(s.weekStart))} · Fri–Thu</p>
 ${tripCard}
+${fuelCard}
 <div class="grid bigstat">
 ${statCard('This week pay', fmtMoney(s.week.pay), `${s.week.loads} loads`)}
 ${statCard('This week miles', fmtNum(s.week.miles), fmtMoney(s.week.gross) + ' gross')}
@@ -777,6 +815,39 @@ ${rows || '<tr><td colspan="3" class="mut">No keys yet — generate one on the U
   });
 }
 
+// ---------- fuel discounts (owner/editor) ----------
+function fuelPage(user, info, trucks, q) {
+  const truckSections = (trucks || []).map(t => {
+    const rows = (t.stops || []).map((s, i) => `<tr>
+<td>${i === 0 ? '⭐ ' : ''}${esc(s.name)}</td><td>${esc(s.city || '')}, ${esc(s.state || '')}</td>
+<td class="num">~${s.distance_mi} mi</td>
+<td class="num"><b>$${Number(s.cust_price).toFixed(2)}</b></td>
+<td class="num">$${Number(s.pump_price).toFixed(2)}</td>
+<td class="num">$${Number(s.savings).toFixed(2)}</td></tr>`).join('');
+    return `<h2>${esc(t.driver_name)} — live trip</h2>
+<p class="mut" style="margin-bottom:8px">${esc(t.origin || '')} → ${esc(t.destination || '')} · last fix ${esc(t.recorded_at || '')}</p>
+${rows ? `<div class="tblwrap"><table>
+<tr><th>Stop</th><th>City</th><th class="num">Distance</th><th class="num">Your price</th><th class="num">Pump</th><th class="num">Save/gal</th></tr>
+${rows}</table></div>` : '<p class="mut">No discount stops within 60 miles of this truck in the current feed.</p>'}`;
+  }).join('');
+  return layout({
+    title: 'Fuel discounts', user, active: '/fuel',
+    body: `<h1>Fuel discounts</h1>${flash(q)}
+<div class="card" style="margin-bottom:14px">
+<p style="margin:0 0 6px"><b>Current feed:</b> ${info.count ? `${info.count} stops · priced as of ${esc(info.feed_date || '')} · ${esc(info.source || '')}` : 'no feed loaded yet'}</p>
+<p class="mut" style="margin:0">Drivers see the best-value stops near them on their home page (price + distance). Stops are placed by city from the feed, so distances are approximate — drivers should confirm the exact location in Maps.</p>
+</div>
+<h2>Update the price feed</h2>
+<form class="f card" method="post" action="/fuel/upload" enctype="multipart/form-data">
+<div class="row"><label>RXO fuel discount report (.xlsx)</label>
+<input type="file" name="feed" accept=".xlsx,.xls,.csv" required></div>
+<button class="btn">Upload & replace prices</button>
+<p class="mut" style="margin-top:8px">Uploading replaces all current stop prices with the new file's.</p>
+</form>
+${truckSections || '<h2>Live trucks</h2><p class="mut">No trucks are on an active trip right now. When a driver starts a trip, their best nearby stops will show here.</p>'}`,
+  });
+}
+
 module.exports = {
   esc, layout, flash,
   setupPage, loginPage,
@@ -785,5 +856,5 @@ module.exports = {
   settlementsPage, driversPage, driverForm, escrowPage, trucksPage, truckForm,
   usersPage, apiDocsPage,
   driverHome, driverLoads, driverLoadDetail, driverSettlements,
-  fleetPage, rateconPage,
+  fleetPage, rateconPage, fuelPage,
 };

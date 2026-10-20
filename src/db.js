@@ -165,6 +165,23 @@ CREATE TABLE IF NOT EXISTS escrow_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_escrow_driver ON escrow_entries(tenant_id, driver_id, date);
 
+-- fuel discount feed (e.g. RXO daily price feed): stops geocoded from city/state
+CREATE TABLE IF NOT EXISTS fuel_stops (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id  TEXT NOT NULL,
+  feed_date  TEXT NOT NULL,
+  name       TEXT NOT NULL,
+  location   TEXT,
+  city       TEXT,
+  state      TEXT,
+  pump_price REAL NOT NULL,
+  cust_price REAL NOT NULL,
+  savings    REAL NOT NULL,
+  lat        REAL NOT NULL,
+  lon        REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fuel_stops_geo ON fuel_stops(tenant_id, lat, lon);
+
 CREATE INDEX IF NOT EXISTS idx_loads_tenant_date ON loads(tenant_id, date);
 CREATE INDEX IF NOT EXISTS idx_loads_driver ON loads(tenant_id, driver_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_tenant_date ON expenses(tenant_id, date);
@@ -243,6 +260,77 @@ function migrate() {
   }
 }
 migrate();
+
+// ---- fuel discount feed ----
+function fuelFeedInfo(tenantId = TENANT) {
+  const row = db.prepare(
+    `SELECT feed_date, COUNT(*) AS n FROM fuel_stops WHERE tenant_id = ? GROUP BY feed_date
+     ORDER BY feed_date DESC LIMIT 1`).get(tenantId);
+  const src = db.prepare(`SELECT v FROM meta WHERE k = 'fuel_feed_source'`).get();
+  return { feed_date: row ? row.feed_date : null, count: row ? row.n : 0, source: src ? src.v : null };
+}
+
+function replaceFuelStops(stops, feedDate, source, tenantId = TENANT) {
+  const del = db.prepare('DELETE FROM fuel_stops WHERE tenant_id = ?');
+  const ins = db.prepare(`INSERT INTO fuel_stops
+    (tenant_id, feed_date, name, location, city, state, pump_price, cust_price, savings, lat, lon)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+  db.exec('BEGIN');
+  try {
+    del.run(tenantId);
+    for (const s of stops) {
+      ins.run(tenantId, feedDate, s.name, s.location || null, s.city || null, s.state || null,
+        s.pump, s.price, s.savings, s.lat, s.lon);
+    }
+    db.prepare(`INSERT INTO meta (k,v) VALUES ('fuel_feed_source',?)
+      ON CONFLICT(k) DO UPDATE SET v = excluded.v`).run(source || '');
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  return stops.length;
+}
+
+// One-time seed from the bundled RXO feed snapshot (data/rxo-seed.json) so the
+// feature works before the first manual upload. Skips when stops already exist.
+function seedFuelStops() {
+  const n = db.prepare('SELECT COUNT(*) AS n FROM fuel_stops WHERE tenant_id = ?').get(TENANT).n;
+  if (n > 0) return;
+  try {
+    const seedPath = path.join(__dirname, '..', 'data', 'rxo-seed.json');
+    const seed = JSON.parse(fs.readFileSync(seedPath, 'utf8'));
+    if (seed && Array.isArray(seed.stops) && seed.stops.length) {
+      replaceFuelStops(seed.stops, seed.feed_date, seed.source || 'seed');
+      console.log(`[fuel] seeded ${seed.stops.length} stops from ${seed.feed_date}`);
+    }
+  } catch (e) { console.log('[fuel] seed skipped: ' + e.message); }
+}
+seedFuelStops();
+
+function haversineMi(lat1, lon1, lat2, lon2) {
+  const R = 3958.8, rad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * rad, dLon = (lon2 - lon1) * rad;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// Best-value stops near a point. Score = customer price + $0.004/gal per mile
+// of distance (detour cost on a ~150-gal fill), so a slightly pricier stop
+// next door can beat a cheaper one 40 miles away.
+function nearestFuelStops(lat, lon, radiusMi = 60, limit = 5, tenantId = TENANT) {
+  const dLat = radiusMi / 69.0, dLon = radiusMi / 53.0; // generous bbox; haversine filters exactly
+  const rows = db.prepare(
+    `SELECT name, location, city, state, pump_price, cust_price, savings, lat, lon
+     FROM fuel_stops WHERE tenant_id = ? AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?`)
+    .all(tenantId, lat - dLat, lat + dLat, lon - dLon, lon + dLon);
+  const scored = [];
+  for (const r of rows) {
+    const dist = haversineMi(lat, lon, r.lat, r.lon);
+    if (dist > radiusMi) continue;
+    scored.push({ ...r, distance_mi: Math.round(dist * 10) / 10, score: r.cust_price + 0.004 * dist });
+  }
+  scored.sort((a, b) => a.score - b.score);
+  return scored.slice(0, limit);
+}
 
 // ---- Query helpers ----
 function userCount(tenantId = TENANT) {
@@ -589,4 +677,5 @@ module.exports = {
   listDocumentsByLoad, getDocument, createDocument, deleteDocument,
   createApiKey, findTenantByApiKey, listApiKeys, deleteApiKey,
   activeTrip, startTrip, endTrip, addPosition, fleetSnapshot,
+  fuelFeedInfo, replaceFuelStops, nearestFuelStops,
 };

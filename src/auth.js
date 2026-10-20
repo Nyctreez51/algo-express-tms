@@ -38,7 +38,7 @@ function scopeGuard(req, res, next) {
   if (!req.user) return next();
   const isDriverPath = req.path === '/driver' || req.path.startsWith('/driver/');
   if (req.user.role === 'driver') {
-    if (!isDriverPath && req.path !== '/logout') return res.redirect('/driver');
+    if (!isDriverPath && req.path !== '/logout' && req.path !== '/fuel/near') return res.redirect('/driver');
     return next();
   }
   if (isDriverPath) return res.redirect('/dashboard');
