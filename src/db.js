@@ -305,6 +305,13 @@ function seedFuelStops() {
 }
 seedFuelStops();
 
+// Light list of delivered loads for lane-history analysis.
+function deliveredLoadsLite(tenantId = TENANT) {
+  return db.prepare(
+    `SELECT origin, destination, loaded_miles, linehaul_cents, fsc_cents, date
+     FROM loads WHERE tenant_id = ? AND status = 'delivered'`).all(tenantId);
+}
+
 function haversineMi(lat1, lon1, lat2, lon2) {
   const R = 3958.8, rad = Math.PI / 180;
   const dLat = (lat2 - lat1) * rad, dLon = (lon2 - lon1) * rad;
@@ -677,5 +684,5 @@ module.exports = {
   listDocumentsByLoad, getDocument, createDocument, deleteDocument,
   createApiKey, findTenantByApiKey, listApiKeys, deleteApiKey,
   activeTrip, startTrip, endTrip, addPosition, fleetSnapshot,
-  fuelFeedInfo, replaceFuelStops, nearestFuelStops,
+  fuelFeedInfo, replaceFuelStops, nearestFuelStops, deliveredLoadsLite,
 };

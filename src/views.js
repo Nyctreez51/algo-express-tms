@@ -80,6 +80,7 @@ function navFor(user) {
   let links = link('/dashboard', 'Dashboard', '/dashboard')
     + link('/fleet', 'Fleet map', '/fleet')
     + link('/fuel', 'Fuel', '/fuel')
+    + link('/analyzer', 'Analyzer', '/analyzer')
     + link('/ratecon', 'Rate con', '/ratecon')
     + link('/loads', 'Loads', '/loads')
     + link('/expenses', 'Expenses', '/expenses')
@@ -848,6 +849,106 @@ ${truckSections || '<h2>Live trucks</h2><p class="mut">No trucks are on an activ
   });
 }
 
+// ---------- load analyzer (owner/editor) ----------
+function analyzerPage(user, drivers, q) {
+  const drvOpts = (drivers || []).filter(d => d.status === 'active').map(d => {
+    const terms = d.pay_type === 'per_mile' ? `$${Number(d.pay_rate || 0).toFixed(2)}/mi` : `${d.pay_pct || 0}% of linehaul`;
+    return `<option value="${d.id}">${esc(d.name)} — ${esc(terms)}</option>`;
+  }).join('');
+  return layout({
+    title: 'Load analyzer', user, active: '/analyzer',
+    body: `<h1>Load analyzer</h1>${flash(q)}
+<p class="mut" style="margin-bottom:12px">Run the numbers before you book. Uses your FSC rule (65¢ x loaded miles carved out of gross), the driver's own pay terms, RXO fuel prices near the pickup, and $147/day fixed cost — all editable.</p>
+<form id="azform" class="f card" onsubmit="return false">
+<div class="two">
+<div class="row"><label>Pickup (City, ST)</label><input id="az-origin" placeholder="Rincon, GA" required></div>
+<div class="row"><label>Drop-off (City, ST)</label><input id="az-dest" placeholder="Adairsville, GA" required></div>
+</div>
+<div class="two">
+<div class="row"><label>Rate offered ($ gross)</label><input id="az-rate" type="number" step="0.01" min="0" placeholder="1424" required></div>
+<div class="row"><label>Driver (for pay math)</label><select id="az-driver"><option value="">— none —</option>${drvOpts}</select></div>
+</div>
+<div class="two">
+<div class="row"><label>Truck starts from (optional, for deadhead)</label><input id="az-from" placeholder="Atlanta, GA"></div>
+<div class="row"><label>…or deadhead miles (manual)</label><input id="az-dh" type="number" step="1" min="0" placeholder="auto"></div>
+</div>
+<div class="two">
+<div class="row"><label>Pickup date (optional)</label><input id="az-pdate" type="date"></div>
+<div class="row"><label>Delivery date (optional)</label><input id="az-ddate" type="date"></div>
+</div>
+<div class="two">
+<div class="row"><label>MPG</label><input id="az-mpg" type="number" step="0.1" min="1" value="7.0"></div>
+<div class="row"><label>Fuel $/gal (blank = RXO near pickup)</label><input id="az-fuel" type="number" step="0.001" min="0" placeholder="auto"></div>
+</div>
+<div class="two">
+<div class="row"><label>Fixed cost $/day</label><input id="az-fixed" type="number" step="1" min="0" value="147"></div>
+<div class="row"><label>Backhaul rate from drop-off (optional)</label><input id="az-back" type="number" step="0.01" min="0" placeholder="—"></div>
+</div>
+<div class="row"><label>Broker (optional, used if you create the load)</label><input id="az-broker" placeholder="J.B. Hunt"></div>
+<button class="btn" id="az-go" type="button">⚡ Analyze load</button>
+</form>
+<div id="az-out" style="margin-top:14px"></div>
+<form id="az-create" method="post" action="/analyzer/create" style="display:none;margin-top:10px">
+<input type="hidden" name="origin"><input type="hidden" name="destination">
+<input type="hidden" name="date"><input type="hidden" name="loaded_miles">
+<input type="hidden" name="empty_miles"><input type="hidden" name="linehaul">
+<input type="hidden" name="fsc"><input type="hidden" name="driver_id">
+<input type="hidden" name="broker"><input type="hidden" name="notes">
+<button class="btn ghost" type="submit">+ Create this load (booked)</button>
+</form>
+<script>(function(){
+function E(id){return document.getElementById(id);}
+function escHtml(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function money(x){return '$'+Number(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function row(k,val){return '<div style="display:flex;justify-content:space-between;padding:3px 0"><span class="mut">'+k+'</span><b>'+val+'</b></div>';}
+E('az-go').addEventListener('click',function(){
+  var qs=new URLSearchParams({
+    origin:E('az-origin').value,destination:E('az-dest').value,rate:E('az-rate').value,
+    driver_id:E('az-driver').value,truckFrom:E('az-from').value,deadheadOverride:E('az-dh').value,
+    pickupDate:E('az-pdate').value,deliveryDate:E('az-ddate').value,mpg:E('az-mpg').value,
+    fuelPrice:E('az-fuel').value,fixedPerDay:E('az-fixed').value,backhaulRate:E('az-back').value});
+  var out=E('az-out');out.innerHTML='<p class="mut">Analyzing…</p>';E('az-create').style.display='none';
+  fetch('/analyzer/data?'+qs.toString()).then(function(r){return r.json();}).then(function(j){
+    if(!j.ok){out.innerHTML='<div class="card"><b>'+escHtml(j.error||'Something went wrong.')+'</b></div>';return;}
+    var vcolor=j.verdict==='Strong'?'#4ade80':j.verdict==='Workable'?'#a3e635':j.verdict==='Thin'?'#facc15':'#f87171';
+    var h='<div class="card" style="margin-bottom:12px"><div style="display:flex;justify-content:space-between;align-items:baseline">'
+      +'<b style="font-size:17px">'+escHtml(j.origin)+' → '+escHtml(j.destination)+'</b>'
+      +'<span style="font-size:17px">NET <b style="color:'+vcolor+'">'+money(j.net)+'</b> · '+j.marginPct+'% · <b style="color:'+vcolor+'">'+j.verdict+'</b></span></div>'
+      +row('Loaded miles',j.loadedMiles+' mi ('+(j.distanceSource==='road'?'road':'est.')+', '+j.driveHours+'h drive)')
+      +(j.deadheadMiles?row('Deadhead',(j.truckFrom?'from '+escHtml(j.truckFrom)+' · ':'')+j.deadheadMiles+' mi'):row('Deadhead','0 mi'))
+      +row('Rate / $ per mile',money(j.rate)+' · $'+j.rpmLoaded+'/loaded mi · $'+j.rpmTruck+'/truck mi')
+      +row('Linehaul / FSC split',money(j.linehaul)+' / '+money(j.fsc))
+      +row('Fuel',j.fuel.gallons+' gal @ $'+Number(j.fuel.price).toFixed(2)+' ('+escHtml(j.fuel.priceNote)+') = '+money(j.fuel.cost))
+      +(j.driverPay?row('Driver pay — '+escHtml(j.driverName),money(j.driverPay.amount)+' <span class="mut">('+escHtml(j.driverPay.basis)+')</span>'):row('Driver pay','pick a driver to include pay'))
+      +row('Fixed cost',j.fixed.days+' day(s) x $'+j.fixed.perDay+' = '+money(j.fixed.cost))
+      +'</div>';
+    h+='<div class="card" style="margin-bottom:12px"><b>Feasibility</b><p style="margin:6px 0 0">'+escHtml(j.feasibility.label)
+      +' · driving needed '+j.feasibility.driveHours+'h'+(j.feasibility.windowHours?' · window '+j.feasibility.windowHours+'h':'')+'</p></div>';
+    if(j.roundTrip){var t=j.roundTrip;
+      h+='<div class="card" style="margin-bottom:12px"><b>Round trip with backhaul</b>'
+        +row('Backhaul',money(t.backhaulRate)+' ('+money(t.linehaul)+' linehaul / '+money(t.fsc)+' FSC)')
+        +row('Round-trip miles',t.roundTripMiles+' mi · revenue '+money(t.revenue)+' · $'+t.rpm+'/mi')
+        +row('Fuel / driver / fixed',money(t.fuelCost)+' / '+money(t.driverPay)+' / '+money(t.fixedCost))
+        +row('Round-trip NET','<span style="font-size:15px">'+money(t.net)+'</span>')+'</div>';}
+    var hs=j.history;
+    h+='<div class="card"><b>Your lane history — '+escHtml(hs.statePair)+'</b><p style="margin:6px 0 0">'
+      +(hs.count?hs.count+' completed load(s) on this state pair'+(hs.exactCount?' ('+hs.exactCount+' exact city pair)':'')
+        +' · avg gross '+money(hs.avgGross)+(hs.avgRpm?' · avg $'+hs.avgRpm+'/mi':'')+' · last ran '+escHtml(hs.lastDate)
+        :'First time on this state pair — no completed loads yet. Every load you deliver builds your rate memory.')
+      +'</p></div>';
+    out.innerHTML=h;
+    var f=E('az-create');var map={origin:j.origin,destination:j.destination,loaded_miles:j.loadedMiles,
+      empty_miles:j.deadheadMiles,linehaul:j.linehaul,fsc:j.fsc,driver_id:E('az-driver').value,
+      broker:E('az-broker').value,date:E('az-pdate').value||new Date().toISOString().slice(0,10),
+      notes:'From Load Analyzer: '+j.origin+' to '+j.destination+', '+money(j.rate)+' gross, est. net '+money(j.net)+' ('+j.verdict+').'};
+    Object.keys(map).forEach(function(k){var inp=f.querySelector('[name="'+k+'"]');if(inp)inp.value=map[k];});
+    f.style.display='block';
+  }).catch(function(){out.innerHTML='<div class="card"><b>Analyzer unreachable — check connection and retry.</b></div>';});
+});
+})();</script>`,
+  });
+}
+
 module.exports = {
   esc, layout, flash,
   setupPage, loginPage,
@@ -856,5 +957,5 @@ module.exports = {
   settlementsPage, driversPage, driverForm, escrowPage, trucksPage, truckForm,
   usersPage, apiDocsPage,
   driverHome, driverLoads, driverLoadDetail, driverSettlements,
-  fleetPage, rateconPage, fuelPage,
+  fleetPage, rateconPage, fuelPage, analyzerPage,
 };

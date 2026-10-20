@@ -10,6 +10,7 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const db = require('./db');
 const auth = require('./auth');
+const AZ = require('./analyze');
 const v = require('./views');
 const D = require('./dates');
 const { fmtNum } = require('./dates');
@@ -775,8 +776,7 @@ router.get('/fuel', auth.requireRoles('owner', 'editor'), (req, res) => {
   res.send(v.fuelPage(req.user, info, trucks, req.query));
 });
 
-const fuelUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
-router.post('/fuel/upload', auth.requireRoles('owner', 'editor'), fuelUpload.single('feed'), (req, res) => {
+const fuelUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });router.post('/fuel/upload', auth.requireRoles('owner', 'editor'), fuelUpload.single('feed'), (req, res) => {
   if (!req.file) return res.redirect('/fuel?err=' + encodeURIComponent('No file chosen.'));
   let XLSX;
   try { XLSX = require('xlsx'); } catch (e) {
@@ -822,6 +822,45 @@ router.post('/fuel/upload', auth.requireRoles('owner', 'editor'), fuelUpload.sin
   res.redirect('/fuel?ok=' + encodeURIComponent(
     `Fuel feed updated: ${n} stops priced as of ${feedDate}${skipped ? ` (${skipped} rows skipped — unrecognized place or bad data)` : ''}.`));
 });
+
+// ----- load analyzer (owner/editor) -----
+router.get('/analyzer', auth.requireRoles('owner', 'editor'), (req, res) => {
+  res.send(v.analyzerPage(req.user, db.listDrivers(), req.query));
+});
+
+router.get('/analyzer/data', auth.requireRoles('owner', 'editor'), async (req, res) => {
+  const q = req.query;
+  const driver = q.driver_id ? db.getDriver(Number(q.driver_id)) : null;
+  const ctx = {
+    driver: driver || null,
+    fuelNear: (lat, lon) => db.nearestFuelStops(lat, lon, 60, 1, T())[0] || null,
+    historyLoads: db.deliveredLoadsLite(T()),
+  };
+  const out = await AZ.analyze({
+    origin: q.origin, destination: q.destination, rate: q.rate,
+    truckFrom: q.truckFrom, deadheadOverride: q.deadheadOverride,
+    mpg: q.mpg, fuelPrice: q.fuelPrice, fixedPerDay: q.fixedPerDay,
+    backhaulRate: q.backhaulRate, pickupDate: q.pickupDate, deliveryDate: q.deliveryDate,
+  }, ctx);
+  res.json(out);
+});
+
+router.post('/analyzer/create', auth.requireRoles('owner', 'editor'),
+  express.urlencoded({ extended: false }), (req, res) => {
+    const b = req.body;
+    const id = db.saveLoad({
+      date: b.date || new Date().toISOString().slice(0, 10),
+      origin: b.origin || null, destination: b.destination || null,
+      loaded_miles: Number(b.loaded_miles) || 0, empty_miles: Number(b.empty_miles) || 0,
+      linehaul_cents: Math.round((Number(b.linehaul) || 0) * 100),
+      fsc_cents: Math.round((Number(b.fsc) || 0) * 100),
+      broker: b.broker || null,
+      driver_id: b.driver_id ? Number(b.driver_id) : null,
+      truck_id: null, status: 'booked',
+      notes: b.notes || 'Created from Load Analyzer.',
+    }, T());
+    res.redirect(`/loads/${id}?ok=` + encodeURIComponent('Load created from analyzer.'));
+  });
 
 // Driver load detail — own loads only, with their documents.
 router.get('/driver/loads/:id', auth.requireRoles('driver'), (req, res) => {
