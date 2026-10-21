@@ -740,37 +740,53 @@ refresh(); setInterval(refresh,30000);
 }
 
 // ---------- rate-con upload (for loads not on Erica's sheet) ----------
-function rateconPage(user, drivers, q) {
-  const drvOpts = drivers.map(d => `<option value="${d.id}">${esc(d.name)}</option>`).join('');
+function rateconPage(user, drivers, q, values, parsed) {
+  const v = values || {};
+  const drvOpts = drivers.map(d => `<option value="${d.id}" ${String(v.driver_id) === String(d.id) ? 'selected' : ''}>${esc(d.name)}</option>`).join('');
+  const statusOpts = ['booked', 'in_transit', 'delivered'].map(s =>
+    `<option value="${s}" ${v.status === s ? 'selected' : ''}>${s}</option>`).join('');
+  const val = (k) => `value="${esc(v[k] || '')}"`;
+  const parsedNote = parsed
+    ? `<div class="card" style="margin-bottom:12px"><p style="margin:0">Using uploaded file: <b>${esc(parsed.fileName)}</b><br>`
+      + (parsed.filled.length
+        ? `Filled from the document: ${esc(parsed.filled.join(', '))}. Check them, pick a driver, then save.`
+        : esc(parsed.note || 'Nothing could be read from this file.'))
+      + `</p></div>`
+    : '';
+  const hiddenParsed = parsed
+    ? `<input type="hidden" name="parsed_file" value="${esc(parsed.parsed_file)}">`
+      + `<input type="hidden" name="parsed_name" value="${esc(parsed.parsed_name)}">`
+    : '';
   return layout({
     title: 'Upload rate con', user, active: '/ratecon',
     body: `<h1>Upload rate confirmation</h1>${flash(q)}
-<p class="mut" style="margin-bottom:10px">For loads that aren't on Erica's dispatch sheet (e.g. Parker's J.B. Hunt runs). The load is matched by load number — if it's already in the system, the rate con updates it.</p>
+<p class="mut" style="margin-bottom:10px">For loads that aren't on Erica's dispatch sheet (e.g. Parker's J.B. Hunt runs). Pick the tender or rate con file, click <b>Read rate con &amp; fill fields</b>, and the load #, cities, miles, money, broker, and dates fill in from the document — check them, pick a driver, then save. The load is matched by load number: if it's already in the system, saving updates it.</p>
+${parsedNote}
 <form class="f card" method="post" action="/ratecon" enctype="multipart/form-data">
+${hiddenParsed}
 <div class="row"><label>Rate confirmation file (PDF, JPG, PNG — max 10MB)</label>
-<input type="file" name="ratecon" accept=".pdf,.jpg,.jpeg,.png" required></div>
+<input type="file" name="ratecon" accept=".pdf,.jpg,.jpeg,.png"></div>
 <div class="two">
-<div class="row"><label>Load # *</label><input name="load_number" required placeholder="e.g. 571992698"></div>
+<div class="row"><label>Load # *</label><input name="load_number" ${val('load_number')} placeholder="e.g. 571992698"></div>
 <div class="row"><label>Driver</label><select name="driver_id"><option value="">—</option>${drvOpts}</select></div></div>
 <div class="two">
-<div class="row"><label>Pick date</label><input name="date" type="date"></div>
-<div class="row"><label>Delivery date</label><input name="delivery_date" type="date"></div></div>
+<div class="row"><label>Pick date</label><input name="date" type="date" ${val('date')}></div>
+<div class="row"><label>Delivery date</label><input name="delivery_date" type="date" ${val('delivery_date')}></div></div>
 <div class="two">
-<div class="row"><label>Origin</label><input name="origin" placeholder="City, ST"></div>
-<div class="row"><label>Destination</label><input name="destination" placeholder="City, ST"></div></div>
+<div class="row"><label>Origin</label><input name="origin" ${val('origin')} placeholder="City, ST"></div>
+<div class="row"><label>Destination</label><input name="destination" ${val('destination')} placeholder="City, ST"></div></div>
 <div class="two">
-<div class="row"><label>Loaded miles</label><input name="loaded_miles" type="number" step="1" min="0"></div>
-<div class="row"><label>Empty miles</label><input name="empty_miles" type="number" step="1" min="0"></div></div>
+<div class="row"><label>Loaded miles</label><input name="loaded_miles" type="number" step="1" min="0" ${val('loaded_miles')}></div>
+<div class="row"><label>Empty miles</label><input name="empty_miles" type="number" step="1" min="0" ${val('empty_miles')}></div></div>
 <div class="two">
-<div class="row"><label>Linehaul $</label><input name="linehaul" type="number" step="0.01" min="0"></div>
-<div class="row"><label>FSC $ (if stated)</label><input name="fsc" type="number" step="0.01" min="0"></div></div>
+<div class="row"><label>Linehaul $</label><input name="linehaul" type="number" step="0.01" min="0" ${val('linehaul')}></div>
+<div class="row"><label>FSC $ (if stated)</label><input name="fsc" type="number" step="0.01" min="0" ${val('fsc')}></div></div>
 <p class="mut">If the rate con shows one total with no FSC breakdown, put the total in Linehaul and leave FSC blank — the system carves out $0.65 × loaded miles as the FSC. Enter 0 for FSC to keep it all as linehaul.</p>
 <div class="two">
-<div class="row"><label>Broker</label><input name="broker" placeholder="e.g. J.B. Hunt"></div>
-<div class="row"><label>Status</label><select name="status">
-<option value="booked">booked</option><option value="in_transit">in_transit</option>
-<option value="delivered">delivered</option></select></div></div>
-<button class="btn">Upload & save load</button>
+<div class="row"><label>Broker</label><input name="broker" ${val('broker')} placeholder="e.g. J.B. Hunt"></div>
+<div class="row"><label>Status</label><select name="status">${statusOpts}</select></div></div>
+<button class="btn" formaction="/ratecon/parse">Read rate con &amp; fill fields</button>
+<button class="btn" style="margin-left:8px">Upload &amp; save load</button>
 <a class="btn ghost" href="/loads" style="margin-left:8px">Cancel</a></form>`,
   });
 }

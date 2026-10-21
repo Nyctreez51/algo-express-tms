@@ -12,6 +12,7 @@ const db = require('./db');
 const auth = require('./auth');
 const AZ = require('./analyze');
 const perf = require('./performance');
+const RC = require('./ratecon');
 const v = require('./views');
 const D = require('./dates');
 const { fmtNum } = require('./dates');
@@ -727,13 +728,51 @@ const uploadRatecon = multer({
   storage: rateconTmp, fileFilter: docFileFilter, limits: { fileSize: MAX_FILE_BYTES },
 });
 router.get('/ratecon', auth.requireRoles('owner', 'editor'), (req, res) => {
-  res.send(v.rateconPage(req.user, db.listDrivers(T()), req.query));
+  res.send(v.rateconPage(req.user, db.listDrivers(T()), req.query, {}, null));
 });
+
+// Step 1 of the upload flow: read the file, fill the form from it. The file
+// is kept in ratecon_tmp and carried through as a hidden field, so the save
+// step still attaches it to the load. Typed values win over parsed ones.
+router.post('/ratecon/parse', auth.requireRoles('owner', 'editor'),
+  uploadRatecon.single('ratecon'), async (req, res) => {
+  const b = req.body || {};
+  if (!req.file) return res.redirect('/ratecon?err=Pick+the+rate+con+file+first.');
+  const values = {
+    load_number: b.load_number || '', driver_id: b.driver_id || '',
+    date: b.date || '', delivery_date: b.delivery_date || '',
+    origin: b.origin || '', destination: b.destination || '',
+    loaded_miles: b.loaded_miles || '', empty_miles: b.empty_miles || '',
+    linehaul: b.linehaul || '', fsc: b.fsc || '', broker: b.broker || '',
+    status: b.status || 'booked',
+  };
+  let parsed = { filled: [], fileName: req.file.originalname,
+    parsed_file: path.basename(req.file.path), parsed_name: req.file.originalname, note: null };
+  try {
+    if (/\.pdf$/i.test(req.file.originalname) || req.file.mimetype === 'application/pdf') {
+      const pdf = require('pdf-parse');
+      const data = await pdf(fs.readFileSync(req.file.path));
+      const out = RC.parseRateconText(data.text);
+      for (const [k, v] of Object.entries(out.fields)) {
+        if (!values[k]) values[k] = v;
+      }
+      parsed.filled = out.filled;
+      if (!out.filled.length) parsed.note = 'Could not read any fields from this PDF — fill in by hand below. The file is still kept for the save step.';
+    } else {
+      parsed.note = 'Photos and images cannot be read automatically — fill in by hand below. The file is still kept for the save step.';
+    }
+  } catch (e) {
+    parsed.note = 'Could not read this file — fill in by hand below. The file is still kept for the save step.';
+  }
+  res.send(v.rateconPage(req.user, db.listDrivers(T()), req.query, values, parsed));
+});
+
 router.post('/ratecon', auth.requireRoles('owner', 'editor'),
   uploadRatecon.single('ratecon'), (req, res) => {
   const b = req.body || {};
   const loadNumber = String(b.load_number || '').trim();
   if (!loadNumber) return res.redirect('/ratecon?err=Load+number+is+required.');
+  if (!req.file && !b.parsed_file) return res.redirect('/ratecon?err=Attach+the+rate+con+file.');
   const loadedMiles = Number(b.loaded_miles) || 0;
   let linehaulC = toCents(b.linehaul);
   let fscC = b.fsc === '' || b.fsc == null ? null : toCents(b.fsc);
@@ -763,8 +802,26 @@ router.post('/ratecon', auth.requireRoles('owner', 'editor'),
       original_name: req.file.originalname,
       stored_path: path.join('load_' + r.id, path.basename(dest)),
       mime: req.file.mimetype, size_bytes: req.file.size,
-      uploaded_by: req.user.email,
+      uploaded_by: req.user.id,
     }, T());
+  } else if (b.parsed_file && /^[A-Za-z0-9._-]+$/.test(b.parsed_file)) {
+    // File carried over from the "Read rate con" step.
+    const tmpPath = path.join(UPLOAD_DIR, 'ratecon_tmp', b.parsed_file);
+    if (fs.existsSync(tmpPath)) {
+      const dir = path.join(UPLOAD_DIR, 'load_' + r.id);
+      fs.mkdirSync(dir, { recursive: true });
+      const dest = path.join(dir, b.parsed_file);
+      fs.renameSync(tmpPath, dest);
+      const ext = path.extname(b.parsed_name || '').toLowerCase();
+      db.createDocument({
+        load_id: r.id, doc_type: 'ratecon',
+        original_name: b.parsed_name || b.parsed_file,
+        stored_path: path.join('load_' + r.id, b.parsed_file),
+        mime: ext === '.pdf' ? 'application/pdf' : 'application/octet-stream',
+        size_bytes: fs.statSync(dest).size,
+        uploaded_by: req.user.id,
+      }, T());
+    }
   }
   res.redirect('/loads/' + r.id + (r.updated ? '?ok=Load+updated+with+rate+con.' : '?ok=Load+created+from+rate+con.'));
 });
