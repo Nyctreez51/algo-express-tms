@@ -11,6 +11,7 @@ const crypto = require('node:crypto');
 const db = require('./db');
 const auth = require('./auth');
 const AZ = require('./analyze');
+const perf = require('./performance');
 const v = require('./views');
 const D = require('./dates');
 const { fmtNum } = require('./dates');
@@ -481,6 +482,28 @@ router.get('/settlements', auth.requireRoles('owner', 'editor', 'viewer'), (req,
   let week = req.query.week || D.weekStartOf(D.todayStr());
   if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) week = D.weekStartOf(D.todayStr());
   res.send(v.settlementsPage(req.user, week, recentWeekStarts(), settlementWeek(week), req.query));
+});
+
+// ---------- performance report + fuel dashboard (owner/editor/viewer) ----------
+function reportPresets() {
+  const today = D.todayStr();
+  return [
+    { label: 'This month', from: today.slice(0, 7) + '-01', to: today },
+    { label: 'Last 30 days', from: D.addDaysStr(today, -29), to: today },
+    { label: 'Last 90 days', from: D.addDaysStr(today, -89), to: today },
+    { label: 'Year to date', from: D.yearStart(today), to: today },
+    { label: 'All time', from: '2024-01-01', to: today },
+  ];
+}
+
+router.get('/performance', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  const d = perf.performanceReport(req.query);
+  res.send(v.performancePage(req.user, d, req.query, db.listDrivers(), db.listTrucks(), reportPresets()));
+});
+
+router.get('/fuel-dashboard', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  const d = perf.fuelDashboard(req.query);
+  res.send(v.fuelDashboardPage(req.user, d, req.query, reportPresets()));
 });
 
 // ----- drivers -----

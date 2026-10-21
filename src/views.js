@@ -80,6 +80,8 @@ function navFor(user) {
   let links = link('/dashboard', 'Dashboard', '/dashboard')
     + link('/fleet', 'Fleet map', '/fleet')
     + link('/fuel', 'Fuel', '/fuel')
+    + link('/fuel-dashboard', 'Fuel dashboard', '/fuel-dashboard')
+    + link('/performance', 'Performance', '/performance')
     + link('/analyzer', 'Analyzer', '/analyzer')
     + link('/ratecon', 'Rate con', '/ratecon')
     + link('/loads', 'Loads', '/loads')
@@ -949,6 +951,102 @@ E('az-go').addEventListener('click',function(){
   });
 }
 
+// ---------- performance report + fuel dashboard (owner/editor/viewer) ----------
+function presetLinks(presets, base) {
+  return `<p class="mut" style="margin:0 0 12px">Quick ranges: ${presets.map(p =>
+    `<a href="${base}?from=${p.from}&to=${p.to}">${esc(p.label)}</a>`).join(' · ')}</p>`;
+}
+
+function rangeForm(base, q, extra) {
+  return `<form method="get" action="${base}" class="rowflex" style="margin-bottom:8px">
+<label style="margin:0">From</label><input type="date" name="from" value="${esc(q.from || '')}" style="max-width:170px">
+<label style="margin:0">To</label><input type="date" name="to" value="${esc(q.to || '')}" style="max-width:170px">
+${extra || ''}<button class="btn">Show</button></form>`;
+}
+
+function performancePage(user, d, q, drivers, trucks, presets) {
+  const t = d.tot;
+  const drvOpts = `<option value="">All drivers</option>` + (drivers || []).filter(x => x.status === 'active').map(x =>
+    `<option value="${x.id}" ${String(q.driver) === String(x.id) ? 'selected' : ''}>${esc(x.name)}</option>`).join('');
+  const trkOpts = `<option value="">All trucks</option>` + (trucks || []).filter(x => x.type === 'tractor').map(x => {
+    const label = x.unit_number || `${x.year || ''} ${x.make || ''} ${x.model || ''}`.trim();
+    return `<option value="${x.id}" ${String(q.truck) === String(x.id) ? 'selected' : ''}>${esc(label)}</option>`;
+  }).join('');
+  const extra = `<label style="margin:0">Driver</label><select name="driver" style="max-width:180px">${drvOpts}</select>`
+    + `<label style="margin:0">Truck</label><select name="truck" style="max-width:180px">${trkOpts}</select>`;
+  const driverRows = d.driverRows.map(x => {
+    const mi = x.loaded + x.empty;
+    return `<tr><td>${esc(x.name)}</td><td class="num">${x.loads}</td><td class="num">${fmtNum(mi)}</td>`
+      + `<td class="num">${fmtMoney(x.gross)}</td><td class="num">$${mi > 0 ? (x.gross / mi / 100).toFixed(2) : '0.00'}</td>`
+      + `<td class="num">${fmtMoney(x.pay)}</td><td class="num">${fmtMoney(x.gross - x.pay)}</td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="mut">No delivered loads in this range.</td></tr>';
+  const truckRows = d.truckRows.map(x => {
+    const mi = x.loaded + x.empty;
+    return `<tr><td>${esc(x.label)}</td><td class="num">${x.loads}</td><td class="num">${fmtNum(mi)}</td>`
+      + `<td class="num">${fmtMoney(x.gross)}</td><td class="num">$${mi > 0 ? (x.gross / mi / 100).toFixed(2) : '0.00'}</td>`
+      + `<td class="num">${fmtMoney(x.expenses)}</td><td class="num">${fmtMoney(x.net)}</td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="mut">No delivered loads in this range.</td></tr>';
+  const brokerRows = d.brokerRows.map(x => {
+    const mi = x.loaded + x.empty;
+    return `<tr><td>${esc(x.broker)}</td><td class="num">${x.loads}</td><td class="num">${fmtNum(mi)}</td>`
+      + `<td class="num">${fmtMoney(x.gross)}</td><td class="num">$${mi > 0 ? (x.gross / mi / 100).toFixed(2) : '0.00'}</td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="mut">No delivered loads in this range.</td></tr>';
+  return layout({ title: 'Performance report', user, active: '/performance',
+    body: `<h1>Performance report</h1>${presetLinks(presets, '/performance')}${rangeForm('/performance', q, extra)}
+<p class="mut" style="margin:0 0 12px">Delivered loads from ${esc(d.from)} to ${esc(d.to)} · driver pay at current terms (settlement rules: per-mile drivers on loaded miles, everyone else % of gross) · deadhead ${t.deadheadPct.toFixed(1)}% of miles.</p>
+<div class="grid">
+${statCard('Gross', fmtMoney(t.gross), `${t.loads} delivered loads`)}
+${statCard('Total miles', fmtNum(t.miles), `${fmtNum(t.loaded)} loaded + ${fmtNum(t.empty)} empty`)}
+${statCard('Rate / mile', '$' + t.rpm.toFixed(2), 'gross ÷ total miles')}
+${statCard('Driver pay', fmtMoney(t.pay), 'settlement rules')}
+${statCard('Net after driver pay', fmtMoney(t.netAfterPay), 'gross − driver pay')}
+${statCard('Net after all expenses', fmtMoney(t.netAfterAll), `gross − pay − ${fmtMoney(t.expenses)} expenses in range`)}
+</div>
+<h2>Per driver</h2>
+<div class="tblwrap"><table><tr><th>Driver</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">$/mi</th><th class="num">Pay</th><th class="num">Net after pay</th></tr>
+${driverRows}</table></div>
+<h2>Per truck</h2>
+<div class="tblwrap"><table><tr><th>Truck</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">$/mi</th><th class="num">Expenses</th><th class="num">Net</th></tr>
+${truckRows}</table></div>
+<h2>Per broker / shipper</h2>
+<div class="tblwrap"><table><tr><th>Broker</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">$/mi</th></tr>
+${brokerRows}</table></div>` });
+}
+
+function fuelDashboardPage(user, d, q, presets) {
+  const t = d.tot;
+  const truckRows = d.truckRows.map(x =>
+    `<tr><td>${esc(x.label)}</td><td class="num">${x.fills}</td><td class="num">${fmtMoney(x.spend)}</td>`
+    + `<td class="num">${fmtNum(x.gallons)} gal</td><td class="num">${x.gallons > 0 ? '$' + x.avgGal.toFixed(2) : '—'}</td>`
+    + `<td class="num">${fmtNum(x.miles)}</td><td class="num">${x.mpg > 0 ? x.mpg.toFixed(2) : '—'}</td></tr>`
+  ).join('') || '<tr><td colspan="7" class="mut">No fuel expenses in this range.</td></tr>';
+  const stateRows = d.stateRows.map(x =>
+    `<tr><td>${esc(x.state)}</td><td class="num">${x.fills}</td><td class="num">${fmtMoney(x.spend)}</td><td class="num">${fmtNum(x.gallons)} gal</td></tr>`
+  ).join('') || '<tr><td colspan="4" class="mut">No fuel expenses in this range.</td></tr>';
+  const trendRows = d.trendRows.map(x =>
+    `<tr><td>${esc(x.ym)}</td><td class="num">${x.fills}</td><td class="num">${fmtMoney(x.spend)}</td><td class="num">${fmtNum(x.gallons)} gal</td></tr>`
+  ).join('');
+  return layout({ title: 'Fuel dashboard', user, active: '/fuel-dashboard',
+    body: `<h1>Fuel dashboard</h1>${presetLinks(presets, '/fuel-dashboard')}${rangeForm('/fuel-dashboard', q, '')}
+<p class="mut" style="margin:0 0 12px">Fuel expenses from ${esc(d.from)} to ${esc(d.to)} · average $/gal covers only fills with gallons recorded; fills without gallons count in spend but not in the average · MPG uses delivered-load miles for the truck in the same range.</p>
+<div class="grid">
+${statCard('Fuel spend', fmtMoney(t.spend), `${t.fills} fills`)}
+${statCard('Gallons', fmtNum(t.gallons) + ' gal', 'fills with gallons recorded')}
+${statCard('Avg $/gal', t.gallons > 0 ? '$' + t.avgGal.toFixed(2) : '—', 'on fills with gallons recorded')}
+${statCard('Trucks fueled', String(d.truckRows.length), '')}
+</div>
+<h2>Per truck</h2>
+<div class="tblwrap"><table><tr><th>Truck</th><th class="num">Fills</th><th class="num">Spend</th><th class="num">Gallons</th><th class="num">Avg $/gal</th><th class="num">Miles</th><th class="num">MPG</th></tr>
+${truckRows}</table></div>
+<h2>By purchase state</h2>
+<div class="tblwrap"><table><tr><th>State</th><th class="num">Fills</th><th class="num">Spend</th><th class="num">Gallons</th></tr>
+${stateRows}</table></div>
+<h2>Monthly trend · last 6 months</h2>
+<div class="tblwrap"><table><tr><th>Month</th><th class="num">Fills</th><th class="num">Spend</th><th class="num">Gallons</th></tr>
+${trendRows}</table></div>
+<p class="mut">For discount prices near a truck, see the <a href="/fuel">Fuel discounts</a> page.</p>` });
+}
+
 module.exports = {
   esc, layout, flash,
   setupPage, loginPage,
@@ -958,4 +1056,5 @@ module.exports = {
   usersPage, apiDocsPage,
   driverHome, driverLoads, driverLoadDetail, driverSettlements,
   fleetPage, rateconPage, fuelPage, analyzerPage,
+  performancePage, fuelDashboardPage,
 };
