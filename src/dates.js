@@ -11,7 +11,15 @@ function ymd(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-function todayStr() { return ymd(new Date()); }
+// Business runs on Eastern time, but the server may run UTC (Railway
+// default). "Today" must therefore be computed in America/New_York, not
+// server-local time — otherwise after 8 PM Eastern the dashboard's Today
+// card starts counting tomorrow and today's pickups vanish from it.
+const ET_DATE = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+});
+
+function todayStr() { return ET_DATE.format(new Date()); }
 
 function parseYmd(s) {
   const [y, m, d] = s.split('-').map(Number);
@@ -45,12 +53,16 @@ function monthLabel(ym) {
   const [y, m] = ym.split('-').map(Number);
   return new Date(y, m - 1, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
 }
-// ["2026-10", "2026-09", ...] newest first
+// ["2026-10", "2026-09", ...] newest first, in Eastern time (see todayStr).
 function recentMonths(n) {
   const out = [];
-  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', year: 'numeric', month: 'numeric',
+  }).formatToParts(new Date());
+  const y = Number(parts.find(p => p.type === 'year').value);
+  const m = Number(parts.find(p => p.type === 'month').value); // 1-12
   for (let i = 0; i < n; i++) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const d = new Date(y, m - 1 - i, 1);
     out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
   }
   return out;
