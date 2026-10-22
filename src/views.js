@@ -5,6 +5,7 @@
 'use strict';
 
 const { fmtMoney, fmtNum, fmtDate, fmtWeekRange, monthLabel, recentMonths, todayStr } = require('./dates');
+const LOGIN_ART = require('./loginArt');
 
 function esc(s) {
   return String(s == null ? '' : s)
@@ -182,8 +183,11 @@ function setupPage() {
 function loginPage(q = {}) {
   return layout({
     title: 'Log in', user: null, bare: true,
-    body: `<div class="loginbox"><div class="card">
-<h1>ALGO Express TMS</h1>${flash(q)}
+    body: `<div style="position:fixed;inset:0;z-index:-1;background:linear-gradient(180deg,rgba(10,14,22,.55) 0%,rgba(10,14,22,.25) 45%,rgba(10,14,22,.88) 100%),url(${LOGIN_ART.HERO}) center 35%/cover no-repeat,#0f141b"></div>
+<div class="loginbox"><div class="card" style="background:rgba(20,27,38,.94);box-shadow:0 18px 50px rgba(0,0,0,.55)">
+<div style="text-align:center;margin-bottom:6px"><img src="${LOGIN_ART.EMBLEM}" alt="ALGO Express" style="width:280px;max-width:100%;height:auto;border-radius:10px"></div>
+<div style="height:3px;width:72px;background:var(--acc);margin:10px auto 12px;border-radius:2px"></div>
+<p class="mut" style="text-align:center;margin-bottom:14px">Transportation Management System · Dispatch and driver login</p>${flash(q)}
 <form class="f" method="post" action="/login">
 <div class="row"><label>Email</label><input name="email" type="email" required autocomplete="username"></div>
 <div class="row"><label>Password</label><input name="password" type="password" required autocomplete="current-password"></div>
