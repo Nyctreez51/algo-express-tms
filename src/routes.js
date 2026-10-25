@@ -833,7 +833,30 @@ router.get('/fleet', auth.requireRoles('owner', 'editor'), (req, res) => {
   res.send(v.fleetPage(req.user));
 });
 router.get('/fleet/data', auth.requireRoles('owner', 'editor'), (req, res) => {
-  res.json({ ok: true, trips: db.fleetSnapshot(T()) });
+  res.json({ ok: true, trips: db.fleetSnapshot(T()), motive: db.listMotivePositions(T()) });
+});
+
+// Motive snapshot positions (X-API-Key). One row per vehicle; each snapshot
+// replaces that vehicle's previous row. recorded_at is the as-of time.
+router.post('/api/v1/positions/upsert', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  const rows = Array.isArray(b.positions) ? b.positions : (b.unit ? [b] : []);
+  if (!rows.length) return res.status(400).json({ ok: false, error: 'positions[] with unit is required' });
+  let n = 0;
+  for (const p of rows) {
+    if (!p.unit) continue;
+    db.upsertMotivePosition({
+      unit: String(p.unit),
+      driver_name: p.driver_name || null,
+      place: p.place || null,
+      lat: p.lat, lon: p.lon,
+      speed_mph: p.speed_mph,
+      recorded_at: p.recorded_at || null,
+      source: p.source || 'Motive snapshot',
+    }, req.tenantId);
+    n++;
+  }
+  res.json({ ok: true, upserted: n });
 });
 
 // ----- fuel discounts (RXO feed): best stops near a location -----

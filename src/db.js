@@ -116,6 +116,25 @@ CREATE TABLE IF NOT EXISTS positions (
 CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips(tenant_id, driver_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_positions_trip ON positions(tenant_id, trip_id, recorded_at);
 
+-- Motive snapshot positions — last-known position per vehicle. Fed by
+-- snapshots (signed-in browser session today, Motive API when the key
+-- lands). NOT live ELD tracking: every row carries its as-of time and the
+-- fleet map labels it as a snapshot. lat/lon are NULL when only a place
+-- name is known — those rows show in the list, with no map pin.
+CREATE TABLE IF NOT EXISTS motive_positions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id   TEXT NOT NULL,
+  unit        TEXT NOT NULL,
+  driver_name TEXT,
+  place       TEXT,
+  lat         REAL,
+  lon         REAL,
+  speed_mph   REAL,
+  recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
+  source      TEXT NOT NULL DEFAULT 'Motive snapshot',
+  UNIQUE (tenant_id, unit)
+);
+
 CREATE TABLE IF NOT EXISTS expenses (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id    TEXT NOT NULL,
@@ -662,6 +681,30 @@ function fleetSnapshot(tenantId = TENANT) {
     WHERE t.tenant_id = ? AND t.ended_at IS NULL
     ORDER BY d.name`).all(tenantId);
 }
+// Motive snapshot positions — one row per vehicle, replaced on each snapshot.
+function upsertMotivePosition(p, tenantId = TENANT) {
+  const lat = p.lat != null && Number.isFinite(Number(p.lat)) ? Number(p.lat) : null;
+  const lon = p.lon != null && Number.isFinite(Number(p.lon)) ? Number(p.lon) : null;
+  const ex = db.prepare(`SELECT id FROM motive_positions WHERE tenant_id = ? AND unit = ?`).get(tenantId, p.unit);
+  if (ex) {
+    db.prepare(`UPDATE motive_positions SET driver_name = ?, place = ?, lat = ?, lon = ?,
+      speed_mph = ?, recorded_at = ?, source = ? WHERE id = ?`)
+      .run(p.driver_name || null, p.place || null, lat, lon,
+        p.speed_mph != null ? Number(p.speed_mph) : null,
+        p.recorded_at || new Date().toISOString(), p.source || 'Motive snapshot', ex.id);
+    return ex.id;
+  }
+  return db.prepare(`INSERT INTO motive_positions
+    (tenant_id, unit, driver_name, place, lat, lon, speed_mph, recorded_at, source)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(tenantId, p.unit, p.driver_name || null, p.place || null, lat, lon,
+      p.speed_mph != null ? Number(p.speed_mph) : null,
+      p.recorded_at || new Date().toISOString(), p.source || 'Motive snapshot').lastInsertRowid;
+}
+function listMotivePositions(tenantId = TENANT) {
+  return db.prepare(`SELECT unit, driver_name, place, lat, lon, speed_mph, recorded_at, source
+    FROM motive_positions WHERE tenant_id = ? ORDER BY unit`).all(tenantId);
+}
 function upsertExpense(e, tenantId = TENANT) {
   if (e.external_id) {
     const ex = db.prepare('SELECT id FROM expenses WHERE tenant_id = ? AND external_id = ?')
@@ -759,5 +802,6 @@ module.exports = {
   listDocumentsByLoad, getDocument, createDocument, deleteDocument,
   createApiKey, findTenantByApiKey, listApiKeys, deleteApiKey,
   activeTrip, startTrip, endTrip, addPosition, fleetSnapshot,
+  upsertMotivePosition, listMotivePositions,
   fuelFeedInfo, replaceFuelStops, nearestFuelStops, deliveredLoadsLite,
 };

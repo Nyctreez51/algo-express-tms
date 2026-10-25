@@ -729,7 +729,7 @@ function fleetPage(user) {
   return layout({
     title: 'Fleet map', user, active: '/fleet',
     body: `<h1>Fleet map</h1>
-<p class="mut" style="margin-bottom:10px">Live positions from drivers' phones — only while a trip is active. Refreshes every 30 seconds.</p>
+<p class="mut" style="margin-bottom:10px">Live positions from drivers' phones — only while a trip is active. Blue dots are Motive last-known positions (snapshots, not live tracking — check the as-of time). Refreshes every 30 seconds.</p>
 <div id="fleetmap" style="height:55vh;min-height:320px;border-radius:12px;z-index:0"></div>
 <div id="fleetlist" style="margin-top:12px"></div>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
@@ -738,6 +738,8 @@ function fleetPage(user) {
 var map=L.map('fleetmap').setView([33.75,-84.39],6);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap contributors'}).addTo(map);
 var markers={};
+var motiveMarkers={};
+function escHtml(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function ago(iso){
   if(!iso) return 'no fix yet';
   var s=Math.floor((Date.now()-new Date(iso.replace(' ','T')+'Z'))/1000);
@@ -761,7 +763,23 @@ function refresh(){
       }
     });
     Object.keys(markers).forEach(function(k){ if(!seen[k]){map.removeLayer(markers[k]);delete markers[k];} });
-    document.getElementById('fleetlist').innerHTML=html||'<p class="mut">No active trips right now.</p>';
+    var mseen={}, mhtml='';
+    (d.motive||[]).forEach(function(m){
+      var key='m:'+m.unit; mseen[key]=1;
+      var mph=(m.speed_mph!=null)?Math.round(m.speed_mph)+' mph · ':'';
+      var label=(m.driver_name?escHtml(m.driver_name):'')+(m.place?((m.driver_name?' · ':'')+escHtml(m.place)):'');
+      mhtml+='<div class="card" style="margin-bottom:8px"><b>🔵 '+escHtml(m.unit)+'</b> <span class="mut">(Motive snapshot)</span>'
+        +'<div class="mut">'+(label?label+'<br>':'')+mph+'as of '+ago(m.recorded_at)+(m.lat==null?' · place only, no pin':'')+'</div></div>';
+      if(m.lat!=null && m.lon!=null){
+        var mpopup='<b>'+escHtml(m.unit)+' (Motive)</b>'+(label?'<br>'+label:'')+'<br>'+mph+'as of '+ago(m.recorded_at);
+        if(motiveMarkers[key]){motiveMarkers[key].setLatLng([m.lat,m.lon]).setPopupContent(mpopup);}
+        else{motiveMarkers[key]=L.circleMarker([m.lat,m.lon],{radius:9,color:'#38bdf8',fillColor:'#38bdf8',fillOpacity:0.7}).addTo(map).bindPopup(mpopup);}
+      }
+    });
+    Object.keys(motiveMarkers).forEach(function(k){ if(!mseen[k]){map.removeLayer(motiveMarkers[k]);delete motiveMarkers[k];} });
+    var out=html;
+    if(mhtml) out+='<h2 style="margin-top:14px">Motive last-known</h2>'+mhtml;
+    document.getElementById('fleetlist').innerHTML=out||'<p class="mut">No active trips right now.</p>';
   }).catch(function(){});
 }
 refresh(); setInterval(refresh,30000);
