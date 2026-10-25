@@ -190,9 +190,24 @@ function loginPage(q = {}) {
 <p class="mut" style="text-align:center;margin-bottom:14px">Transportation Management System · Dispatch and driver login</p>${flash(q)}
 <form class="f" method="post" action="/login">
 <div class="row"><label>Email</label><input name="email" type="email" required autocomplete="username"></div>
-<div class="row"><label>Password</label><input name="password" type="password" required autocomplete="current-password"></div>
+<div class="row"><label>Password</label>
+<div style="display:flex;gap:8px">
+<input id="pw" name="password" type="password" required autocomplete="current-password" style="flex:1">
+<button type="button" class="btn ghost" id="pw-toggle" aria-label="Show password" title="Show password" style="padding:0 14px">👁️</button>
+</div></div>
 <button class="btn" style="width:100%">Log in</button>
-</form></div></div>`,
+</form>
+<script>(function(){
+var b=document.getElementById('pw-toggle'), i=document.getElementById('pw');
+if(b&&i){b.addEventListener('click',function(){
+  var show=i.type==='password';
+  i.type=show?'text':'password';
+  b.textContent=show?'🙈':'👁️';
+  b.setAttribute('aria-label',show?'Hide password':'Show password');
+  b.setAttribute('title',show?'Hide password':'Show password');
+  i.focus();
+});}
+})();</script></div></div>`,
   });
 }
 
