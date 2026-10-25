@@ -544,7 +544,6 @@ function usersPage(user, users, drivers, q, newKey) {
 <td>${esc(u.driver_name || '—')}</td>
 <td><span class="pill ${u.active ? 'green' : ''}">${u.active ? 'active' : 'disabled'}</span></td>
 <td class="mut">${esc((u.created_at || '').slice(0, 10))}</td>
-<td class="mut">${u.last_login_at ? esc(u.last_login_at.slice(0, 16)) : '—'}${u.failed_login_count ? ` <span style="color:var(--danger)">(${u.failed_login_count} failed)</span>` : ''}</td>
 <td>${u.id !== user.id ? `<form method="post" action="/users/${u.id}/toggle" style="display:inline">
 <button class="btn small ghost">${u.active ? 'Disable' : 'Enable'}</button></form>` : '<span class="mut">you</span>'}</td></tr>`).join('');
   const drvOpts = drivers.map(d => `<option value="${d.id}">${esc(d.name)}</option>`).join('');
@@ -553,7 +552,7 @@ function usersPage(user, users, drivers, q, newKey) {
     body: `<h1>Users & access</h1>${flash(q)}
 ${newKey ? `<div class="okmsg">New API key (shown once — copy it now):<br><code>${esc(newKey)}</code></div>` : ''}
 <div class="tblwrap"><table>
-<tr><th>Email</th><th>Role</th><th>Driver</th><th>Status</th><th>Added</th><th>Last login</th><th></th></tr>${rows}</table></div>
+<tr><th>Email</th><th>Role</th><th>Driver</th><th>Status</th><th>Added</th><th></th></tr>${rows}</table></div>
 <h2>Invite someone</h2>
 <form class="f card" method="post" action="/users/new">
 <div class="two">
@@ -583,12 +582,9 @@ function driverHome(user, s) {
     `<option value="${l.id}">${esc(fmtDate(l.date))} · ${esc(l.origin || '')} → ${esc(l.destination || '')}</option>`).join('');
   const tripCard = trip ? `
 <div class="card" style="margin-bottom:12px">
-<p style="margin:0 0 6px"><span class="pill green">● LIVE</span> <b>Tracking on — sharing your location</b></p>
-<p class="mut" style="margin:0 0 8px">Tracking starts automatically when you open the app — every mile counts, trip or not. Keep this page open while driving. iPhones stop sharing when the screen locks.</p>
-<form method="post" action="/driver/trip/load"><div class="row">
-<label>Link a load to this tracking (optional)</label><select name="load_id"><option value="">Just driving / positioning</option>${loadOpts}</select></div>
-<button class="btn ghost">Link load</button></form>
-<form method="post" action="/driver/trip/end" style="margin-top:8px"><button class="btn danger">Stop tracking</button></form>
+<p style="margin:0 0 6px"><span class="pill green">● LIVE</span> <b>Trip active — sharing your location</b></p>
+<p class="mut" style="margin:0 0 8px">Keep this page open while driving. iPhones stop sharing when the screen locks. Location stops when you end the trip.</p>
+<form method="post" action="/driver/trip/end"><button class="btn danger">End trip</button></form>
 <div id="tripstatus" class="mut" style="margin-top:8px"></div></div>
 <script>(function(){
 var el=document.getElementById('tripstatus');
@@ -773,10 +769,10 @@ function refresh(){
       var lane=t.origin?(' · '+t.origin+' → '+t.destination):'';
       var mph=(t.speed!=null)?Math.round(t.speed)+' mph · ':'';
       html+='<div class="card" style="margin-bottom:8px"><b>'+t.driver_name+'</b>'+lane+
-        '<div class="mut">'+mph+ago(t.recorded_at)+' · '+t.fixes+' fixes'+(t.miles!=null?' · '+Math.round(t.miles)+' mi':'')+'</div></div>';
+        '<div class="mut">'+mph+ago(t.recorded_at)+' · '+t.fixes+' fixes</div></div>';
       if(t.lat!=null){
         var popup='<b>'+t.driver_name+'</b>'+(t.origin?('<br>'+t.origin+' → '+t.destination):'')+
-          '<br>'+mph+ago(t.recorded_at)+(t.miles!=null?' · '+Math.round(t.miles)+' mi':'');
+          '<br>'+mph+ago(t.recorded_at);
         if(markers[t.trip_id]){markers[t.trip_id].setLatLng([t.lat,t.lon]).setPopupContent(popup);}
         else{markers[t.trip_id]=L.marker([t.lat,t.lon]).addTo(map).bindPopup(popup);}
       }

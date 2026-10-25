@@ -42,7 +42,6 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   token      TEXT PRIMARY KEY,
   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
   expires_at TEXT NOT NULL
 );
 
@@ -277,15 +276,6 @@ function migrate() {
   const ecols = db.prepare(`PRAGMA table_info(expenses)`).all().map(c => c.name);
   if (!ecols.includes('gallons')) db.exec(`ALTER TABLE expenses ADD COLUMN gallons REAL`);
   if (!ecols.includes('fuel_state')) db.exec(`ALTER TABLE expenses ADD COLUMN fuel_state TEXT`);
-  // Driver login visibility (Oct 25, 2026): last successful login + failed
-  // tries per user, so the owner can see who has actually been logging in.
-  // Failed logins are counts only — no passwords or attempt details stored.
-  const ucols = db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);
-  if (!ucols.includes('last_login_at')) db.exec(`ALTER TABLE users ADD COLUMN last_login_at TEXT`);
-  if (!ucols.includes('failed_login_count')) db.exec(`ALTER TABLE users ADD COLUMN failed_login_count INTEGER NOT NULL DEFAULT 0`);
-  if (!ucols.includes('last_failed_at')) db.exec(`ALTER TABLE users ADD COLUMN last_failed_at TEXT`);
-  const scols = db.prepare(`PRAGMA table_info(sessions)`).all().map(c => c.name);
-  if (!scols.includes('created_at')) db.exec(`ALTER TABLE sessions ADD COLUMN created_at TEXT NOT NULL DEFAULT (datetime('now'))`);
   // Owner-confirmed driver pay terms, Oct 18 2026. Runs once; never overwrites
   // values the owner later changes in the UI.
   const done = db.prepare(`SELECT v FROM meta WHERE k='payterms-2026-10-18'`).get();
@@ -469,22 +459,8 @@ function newSessionToken() {
 
 function createSession(token, userId, days) {
   const exp = new Date(Date.now() + days * 864e5).toISOString();
-  db.prepare(`INSERT INTO sessions (token, user_id, created_at, expires_at)
-    VALUES (?,?,datetime('now'),?)`).run(token, userId, exp);
-}
-
-// Last successful login (resets the failed-tries count). Called on login.
-function recordLogin(userId) {
-  db.prepare(`UPDATE users SET last_login_at = datetime('now'), failed_login_count = 0
-    WHERE id = ?`).run(userId);
-}
-
-// Failed-login count only — no password or attempt details are stored.
-// No-ops for unknown emails (never reveals whether an email exists).
-function recordFailedLogin(email, tenantId = TENANT) {
-  db.prepare(`UPDATE users SET failed_login_count = failed_login_count + 1,
-    last_failed_at = datetime('now') WHERE tenant_id = ? AND email = ?`)
-    .run(tenantId, String(email || '').trim().toLowerCase());
+  db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)')
+    .run(token, userId, exp);
 }
 
 function getSession(token) {
@@ -672,33 +648,6 @@ function endTrip(driverId, tenantId = TENANT) {
     .run(t.id, tenantId);
   return t.id;
 }
-// Link a load to the driver's active tracking trip. The load must belong
-// to this driver — otherwise nothing changes.
-function attachTripLoad(driverId, loadId, tenantId = TENANT) {
-  const t = activeTrip(driverId, tenantId);
-  if (!t) return null;
-  const load = db.prepare(`SELECT id FROM loads WHERE id = ? AND tenant_id = ? AND driver_id = ?`)
-    .get(loadId, tenantId, driverId);
-  if (!load) return null;
-  db.prepare(`UPDATE trips SET load_id = ? WHERE id = ? AND tenant_id = ?`).run(loadId, t.id, tenantId);
-  return t.id;
-}
-// Miles driven on a trip from its GPS breadcrumbs. Segments implying
-// impossible speed (>100 mph) are skipped as GPS glitches.
-function tripMiles(tripId, tenantId = TENANT) {
-  const pts = db.prepare(`SELECT lat, lon, recorded_at FROM positions
-    WHERE trip_id = ? AND tenant_id = ? ORDER BY recorded_at, id`).all(tripId, tenantId);
-  let total = 0;
-  for (let i = 1; i < pts.length; i++) {
-    const a = pts[i - 1], b = pts[i];
-    const d = haversineMi(a.lat, a.lon, b.lat, b.lon);
-    const dtH = (new Date(b.recorded_at.replace(' ', 'T') + 'Z') - new Date(a.recorded_at.replace(' ', 'T') + 'Z')) / 3600000;
-    if (dtH > 0 && d / dtH > 100) continue;
-    if (dtH <= 0 && d > 0.5) continue;
-    total += d;
-  }
-  return Math.round(total * 10) / 10;
-}
 function addPosition(driverId, pos, tenantId = TENANT) {
   const t = activeTrip(driverId, tenantId);
   if (!t) return null;
@@ -718,7 +667,7 @@ function addPosition(driverId, pos, tenantId = TENANT) {
 }
 // Active trips with latest fix — for the owner's fleet map.
 function fleetSnapshot(tenantId = TENANT) {
-  const trips = db.prepare(
+  return db.prepare(
     `SELECT t.id AS trip_id, t.driver_id, d.name AS driver_name, t.load_id,
       l.origin, l.destination, t.started_at,
       p.lat, p.lon, p.speed, p.recorded_at,
@@ -731,7 +680,6 @@ function fleetSnapshot(tenantId = TENANT) {
       ORDER BY recorded_at DESC LIMIT 1)
     WHERE t.tenant_id = ? AND t.ended_at IS NULL
     ORDER BY d.name`).all(tenantId);
-  return trips.map(t => ({ ...t, miles: t.fixes > 1 ? tripMiles(t.trip_id, tenantId) : 0 }));
 }
 // Motive snapshot positions — one row per vehicle, replaced on each snapshot.
 function upsertMotivePosition(p, tenantId = TENANT) {
@@ -857,8 +805,7 @@ module.exports = {
   createEscrowEntry, listEscrowEntries, escrowBalance, escrowWithheld,
   listDocumentsByLoad, getDocument, createDocument, deleteDocument,
   createApiKey, findTenantByApiKey, listApiKeys, deleteApiKey,
-  activeTrip, startTrip, endTrip, addPosition, attachTripLoad, tripMiles, fleetSnapshot,
-  recordLogin, recordFailedLogin,
+  activeTrip, startTrip, endTrip, addPosition, fleetSnapshot,
   upsertMotivePosition, listMotivePositions,
   fuelFeedInfo, replaceFuelStops, nearestFuelStops, deliveredLoadsLite,
 };

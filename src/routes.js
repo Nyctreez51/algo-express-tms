@@ -118,10 +118,8 @@ router.post('/login', express.urlencoded({ extended: false }), (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const u = db.findUserByEmail(T(), email);
   if (!u || !u.active || !auth.verifyPassword(String(req.body.password || ''), u.password_hash)) {
-    db.recordFailedLogin(email, T());
     return res.status(401).send(v.loginPage({ err: 'Wrong email or password.' }));
   }
-  db.recordLogin(u.id);
   auth.startSession(res, db.findUserById(u.id));
   res.redirect(u.role === 'driver' ? '/driver' : '/dashboard');
 });
@@ -692,11 +690,6 @@ function driverStats(driverId) {
 
 router.get('/driver', auth.requireRoles('driver'), (req, res) => {
   if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
-  // Tracking is automatic: opening the driver home starts a positioning
-  // trip when none is active, so every mile is recorded while the page is
-  // open — no Start button needed. Pickup/delivery times come from the
-  // rate con, POD, and dispatch sheet, not from trip taps.
-  if (!db.activeTrip(req.user.driver_id, T())) db.startTrip(req.user.driver_id, null, T());
   res.send(v.driverHome(req.user, driverStats(req.user.driver_id)));
 });
 router.get('/driver/loads', auth.requireRoles('driver'), (req, res) => {
@@ -733,16 +726,7 @@ router.post('/driver/trip/start', auth.requireRoles('driver'), express.urlencode
 router.post('/driver/trip/end', auth.requireRoles('driver'), express.urlencoded({ extended: false }), (req, res) => {
   if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
   db.endTrip(req.user.driver_id, T());
-  res.redirect('/driver?ok=Tracking+stopped.+It+restarts+automatically+next+time+you+open+the+app.');
-});
-// Link a load to the active tracking trip (lane shown on the fleet map).
-router.post('/driver/trip/load', auth.requireRoles('driver'), express.urlencoded({ extended: false }), (req, res) => {
-  if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
-  const loadId = req.body.load_id ? Number(req.body.load_id) : null;
-  if (!loadId || !db.attachTripLoad(req.user.driver_id, loadId, T())) {
-    return res.redirect('/driver?err=Could+not+link+that+load.');
-  }
-  res.redirect('/driver?ok=Load+linked+to+tracking.');
+  res.redirect('/driver?ok=Trip+ended.');
 });
 router.post('/driver/position', auth.requireRoles('driver'), express.json(), (req, res) => {
   if (!req.user.driver_id) return res.status(403).json({ ok: false });
