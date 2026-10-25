@@ -239,6 +239,15 @@ function seed() {
 seed();
 
 // ---- one-time migrations for databases created before a schema change ----
+// TMS display bands for safety scores (not Motive's own labels;
+// Motive rates 85–95 GOOD for the fleet period).
+function safetyGrade(score) {
+  if (score >= 90) return 'Excellent';
+  if (score >= 85) return 'Good';
+  if (score >= 80) return 'Needs Improvement';
+  return 'Priority Coaching';
+}
+
 function migrate() {
   db.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)`);
   const cols = db.prepare(`PRAGMA table_info(drivers)`).all().map(c => c.name);
@@ -257,6 +266,50 @@ function migrate() {
     db.prepare(`UPDATE drivers SET pay_pct=35 WHERE tenant_id=? AND name='Michael Parker'`).run(TENANT);
     db.prepare(`UPDATE drivers SET pay_pct=25 WHERE tenant_id=? AND name='Jason Clark'`).run(TENANT);
     db.prepare(`INSERT INTO meta (k,v) VALUES ('payterms-2026-10-18','1')`).run();
+  }
+  // Safety scores (Motive) — one row per driver per period.
+  db.exec(`CREATE TABLE IF NOT EXISTS safety_scores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    driver_id INTEGER NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    score INTEGER NOT NULL,
+    grade TEXT NOT NULL,
+    focus TEXT,
+    miles REAL,
+    events_per_1k REAL,
+    speeding_pct REAL,
+    source TEXT NOT NULL DEFAULT 'Motive',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  // One-time seed: Motive safety scores, period Sep 21 – Oct 18, 2026.
+  // Drivers without a TMS row are skipped — their scores attach once the
+  // driver entry exists. Devin Jackson is deliberately excluded: he is not
+  // on the TMS.
+  const safetyDone = db.prepare(`SELECT v FROM meta WHERE k='safety-scores-2026-10-25'`).get();
+  if (!safetyDone) {
+    const seedScores = [
+      // name, score, miles, events/1k, speeding %, focus
+      ['Donte Murrill', 96, 11528.30, 3.0, 0.5,
+       "Keep it up — lowest event rate on the fleet and lowest speeding. Watch following distance, the fleet's top score drag."],
+      ['Shdermon Hammond', 91, 8049.86, 5.7, 1.0,
+       "Smooth braking and following distance — the fleet's two biggest score drags."],
+      ['Tyler Carter', 87, 643.74, 45.0, 7.5,
+       'Speed control first — highest speeding rate on the fleet (7.5%). Bring the event rate down.'],
+      ['Michael Parker', 83, 3780.42, 11.9, 1.8,
+       'Full stops at stop signs (Millen, Waynesboro), smooth braking (Oxford), and safe parking (Marietta).'],
+      ['Jason Clark', 80, 9431.79, 51.0, 3.8,
+       'Following distance (Baton Rouge) and safe parking (Metairie, Grosse Tete). Highest event rate on the fleet — bring it down.'],
+    ];
+    const insS = db.prepare(`INSERT INTO safety_scores
+      (tenant_id, driver_id, period_start, period_end, score, grade, focus, miles, events_per_1k, speeding_pct, source)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+    for (const [name, score, miles, ev, spd, focus] of seedScores) {
+      const drv = findDriverByName(name, TENANT);
+      if (drv) insS.run(TENANT, drv.id, '2026-09-21', '2026-10-18', score, safetyGrade(score), focus, miles, ev, spd, 'Motive');
+    }
+    db.prepare(`INSERT INTO meta (k,v) VALUES ('safety-scores-2026-10-25','1')`).run();
   }
 }
 migrate();
@@ -453,6 +506,21 @@ function saveDriver(d, tenantId = TENANT) {
   const r = db.prepare(
     'INSERT INTO drivers (tenant_id, name, phone, pay_pct, pay_type, pay_rate, status, notes) VALUES (?,?,?,?,?,?,?,?)'
   ).run(tenantId, d.name, d.phone || null, d.pay_pct ?? 30, payType, payRate, d.status || 'active', d.notes || null);
+  return r.lastInsertRowid;
+}
+
+// ---- Driver safety scores (Motive) ----
+function latestSafetyScore(driverId, tenantId = TENANT) {
+  return db.prepare(`SELECT * FROM safety_scores
+    WHERE tenant_id = ? AND driver_id = ? ORDER BY period_end DESC, id DESC LIMIT 1`)
+    .get(tenantId, driverId) || null;
+}
+function saveSafetyScore(s, tenantId = TENANT) {
+  const r = db.prepare(`INSERT INTO safety_scores
+    (tenant_id, driver_id, period_start, period_end, score, grade, focus, miles, events_per_1k, speeding_pct, source)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(tenantId, s.driver_id, s.period_start, s.period_end, s.score, s.grade || safetyGrade(s.score),
+      s.focus || null, s.miles || null, s.events_per_1k || null, s.speeding_pct || null, s.source || 'Motive');
   return r.lastInsertRowid;
 }
 
@@ -678,6 +746,7 @@ module.exports = {
   getCompany,
   listTrucks, getTruck, saveTruck, findTruckByUnit,
   listDrivers, getDriver, findDriverByName, saveDriver,
+  safetyGrade, latestSafetyScore, saveSafetyScore,
   listLoads, getLoad, saveLoad, upsertLoad, deleteLoad,
   listExpenses, getExpense, saveExpense, upsertExpense, deleteExpense,
   createEscrowEntry, listEscrowEntries, escrowBalance, escrowWithheld,

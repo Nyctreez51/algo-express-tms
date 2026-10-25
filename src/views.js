@@ -410,9 +410,14 @@ function driversPage(user, drivers, q) {
   const rows = drivers.map(d => {
     const payLabel = d.pay_type === 'per_mile' && Number(d.pay_rate) > 0
       ? `$${Number(d.pay_rate).toFixed(2)}/mi` : `${d.pay_pct}%`;
+    const gradeCls = d.safety && (d.safety.grade === 'Excellent' || d.safety.grade === 'Good') ? ' green' : '';
+    const safetyCell = d.safety
+      ? `<b>${d.safety.score}</b> <span class="pill${gradeCls}">${esc(d.safety.grade)}</span>`
+      : '—';
     return `<tr><td>${esc(d.name)}</td><td>${esc(d.phone || '—')}</td>
 <td class="num">${payLabel}</td>
 <td><span class="pill ${d.status === 'active' ? 'green' : ''}">${esc(d.status)}</span></td>
+<td>${safetyCell}</td>
 <td class="num">${d.escrow_balance ? fmtMoney(d.escrow_balance) : '—'}</td>
 <td><a class="btn small ghost" href="/drivers/${d.id}/escrow">Escrow</a>
 <a class="btn small ghost" href="/drivers/${d.id}/edit">Edit</a></td></tr>`;
@@ -422,8 +427,8 @@ function driversPage(user, drivers, q) {
     body: `${flash(q)}<div class="rowflex"><h1 style="margin:0">Drivers</h1><div class="spacer"></div>
 <a class="btn" href="/drivers/new">+ Add driver</a></div>
 <div class="tblwrap" style="margin-top:12px"><table>
-<tr><th>Name</th><th>Phone</th><th class="num">Pay</th><th>Status</th><th class="num">Escrow bal</th><th></th></tr>
-${rows || '<tr><td colspan="6" class="mut">No drivers yet.</td></tr>'}</table></div>`,
+<tr><th>Name</th><th>Phone</th><th class="num">Pay</th><th>Status</th><th>Safety</th><th class="num">Escrow bal</th><th></th></tr>
+${rows || '<tr><td colspan="7" class="mut">No drivers yet.</td></tr>'}</table></div>`,
   });
 }
 
@@ -625,9 +630,22 @@ function go(){
 }
 go();
 })();</script>`;
+  const safetyGradeCls = s.safety && (s.safety.grade === 'Excellent' || s.safety.grade === 'Good') ? ' green' : '';
+  const safetyCard = s.safety ? `
+<div class="card" style="margin-bottom:12px">
+<p style="margin:0 0 6px"><b>🛡️ Your safety score</b> <span class="mut">· Motive, ${esc(fmtDate(s.safety.period_start))} – ${esc(fmtDate(s.safety.period_end))}</span></p>
+<p style="margin:0 0 6px;font-size:32px"><b>${s.safety.score}</b> <span class="pill${safetyGradeCls}" style="font-size:14px">${esc(s.safety.grade)}</span></p>
+<p style="margin:0 0 6px"><b>Work on:</b> ${esc(s.safety.focus || '—')}</p>
+<p class="mut" style="margin:0">${fmtNum(s.safety.miles || 0)} miles · ${s.safety.events_per_1k} events per 1,000 mi · ${s.safety.speeding_pct}% speeding</p>
+</div>` : `
+<div class="card" style="margin-bottom:12px">
+<p style="margin:0"><b>🛡️ Your safety score</b></p>
+<p class="mut" style="margin:0">No safety score on file yet — scores update from Motive.</p>
+</div>`;
   const body = `
 <h1 style="font-size:20px">Hi, ${esc(user.driver_name || 'driver')} 👋</h1>
 <p class="mut" style="margin-bottom:12px">Week of ${esc(fmtWeekRange(s.weekStart))} · Fri–Thu</p>
+${safetyCard}
 ${tripCard}
 ${fuelCard}
 <div class="grid bigstat">

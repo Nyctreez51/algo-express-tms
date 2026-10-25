@@ -509,7 +509,8 @@ router.get('/fuel-dashboard', auth.requireRoles('owner', 'editor', 'viewer'), (r
 
 // ----- drivers -----
 router.get('/drivers', auth.canEdit, (req, res) => {
-  const drivers = db.listDrivers().map(d => ({ ...d, escrow_balance: db.escrowBalance(d.id) }));
+  const drivers = db.listDrivers().map(d => ({ ...d, escrow_balance: db.escrowBalance(d.id),
+    safety: db.latestSafetyScore(d.id) }));
   res.send(v.driversPage(req.user, drivers, req.query));
 });
 router.get('/drivers/new', auth.canEdit, (req, res) => {
@@ -656,6 +657,7 @@ function driverStats(driverId) {
     week: { ...week, pay: Math.round(week.revenue * payPct / 100) },
     ytd: { ...ytd, pay: Math.round(ytd.revenue * payPct / 100) },
     recent, payPct,
+    safety: db.latestSafetyScore(driverId, T()),
     trip: db.activeTrip(driverId, T()),
     openLoads,
   };
