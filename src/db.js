@@ -685,13 +685,17 @@ function fleetSnapshot(tenantId = TENANT) {
 function upsertMotivePosition(p, tenantId = TENANT) {
   const lat = p.lat != null && Number.isFinite(Number(p.lat)) ? Number(p.lat) : null;
   const lon = p.lon != null && Number.isFinite(Number(p.lon)) ? Number(p.lon) : null;
+  // recorded_at is stored as UTC "YYYY-MM-DD HH:MM:SS" — the fleet map's
+  // age display appends "Z" itself, so an ISO string with Z would break it.
+  const m = String(p.recorded_at || '').match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+  const recordedAt = m ? `${m[1]} ${m[2]}` : new Date().toISOString().replace('T', ' ').slice(0, 19);
   const ex = db.prepare(`SELECT id FROM motive_positions WHERE tenant_id = ? AND unit = ?`).get(tenantId, p.unit);
   if (ex) {
     db.prepare(`UPDATE motive_positions SET driver_name = ?, place = ?, lat = ?, lon = ?,
       speed_mph = ?, recorded_at = ?, source = ? WHERE id = ?`)
       .run(p.driver_name || null, p.place || null, lat, lon,
         p.speed_mph != null ? Number(p.speed_mph) : null,
-        p.recorded_at || new Date().toISOString(), p.source || 'Motive snapshot', ex.id);
+        recordedAt, p.source || 'Motive snapshot', ex.id);
     return ex.id;
   }
   return db.prepare(`INSERT INTO motive_positions
@@ -699,7 +703,7 @@ function upsertMotivePosition(p, tenantId = TENANT) {
     VALUES (?,?,?,?,?,?,?,?,?)`)
     .run(tenantId, p.unit, p.driver_name || null, p.place || null, lat, lon,
       p.speed_mph != null ? Number(p.speed_mph) : null,
-      p.recorded_at || new Date().toISOString(), p.source || 'Motive snapshot').lastInsertRowid;
+      recordedAt, p.source || 'Motive snapshot').lastInsertRowid;
 }
 function listMotivePositions(tenantId = TENANT) {
   return db.prepare(`SELECT unit, driver_name, place, lat, lon, speed_mph, recorded_at, source

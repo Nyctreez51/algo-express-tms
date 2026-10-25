@@ -204,6 +204,31 @@ router.post('/api/v1/expenses/upsert', apiAuth, express.json(), (req, res) => {
   res.json({ ok: true, id: r.id, updated: r.updated });
 });
 
+// Motive snapshot positions (X-API-Key). One row per vehicle; each snapshot
+// replaces that vehicle's previous row. recorded_at is the as-of time.
+// NOTE: this must stay above the "everything below needs a login" guard,
+// like the other sync endpoints — session auth would redirect API callers.
+router.post('/api/v1/positions/upsert', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  const rows = Array.isArray(b.positions) ? b.positions : (b.unit ? [b] : []);
+  if (!rows.length) return res.status(400).json({ ok: false, error: 'positions[] with unit is required' });
+  let n = 0;
+  for (const p of rows) {
+    if (!p.unit) continue;
+    db.upsertMotivePosition({
+      unit: String(p.unit),
+      driver_name: p.driver_name || null,
+      place: p.place || null,
+      lat: p.lat, lon: p.lon,
+      speed_mph: p.speed_mph,
+      recorded_at: p.recorded_at || null,
+      source: p.source || 'Motive snapshot',
+    }, req.tenantId);
+    n++;
+  }
+  res.json({ ok: true, upserted: n });
+});
+
 // ---------- everything below needs a login ----------
 router.use(auth.requireAuth, auth.scopeGuard);
 
@@ -834,29 +859,6 @@ router.get('/fleet', auth.requireRoles('owner', 'editor'), (req, res) => {
 });
 router.get('/fleet/data', auth.requireRoles('owner', 'editor'), (req, res) => {
   res.json({ ok: true, trips: db.fleetSnapshot(T()), motive: db.listMotivePositions(T()) });
-});
-
-// Motive snapshot positions (X-API-Key). One row per vehicle; each snapshot
-// replaces that vehicle's previous row. recorded_at is the as-of time.
-router.post('/api/v1/positions/upsert', apiAuth, express.json(), (req, res) => {
-  const b = req.body || {};
-  const rows = Array.isArray(b.positions) ? b.positions : (b.unit ? [b] : []);
-  if (!rows.length) return res.status(400).json({ ok: false, error: 'positions[] with unit is required' });
-  let n = 0;
-  for (const p of rows) {
-    if (!p.unit) continue;
-    db.upsertMotivePosition({
-      unit: String(p.unit),
-      driver_name: p.driver_name || null,
-      place: p.place || null,
-      lat: p.lat, lon: p.lon,
-      speed_mph: p.speed_mph,
-      recorded_at: p.recorded_at || null,
-      source: p.source || 'Motive snapshot',
-    }, req.tenantId);
-    n++;
-  }
-  res.json({ ok: true, upserted: n });
 });
 
 // ----- fuel discounts (RXO feed): best stops near a location -----
