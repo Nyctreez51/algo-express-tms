@@ -359,7 +359,13 @@ function seedFuelStops() {
 seedFuelStops();
 
 // Light list of delivered loads for lane-history analysis.
-function deliveredLoadsLite(tenantId = TENANT) {
+// Pass a driverId to scope the history to one driver's own loads.
+function deliveredLoadsLite(tenantId = TENANT, driverId = null) {
+  if (driverId) {
+    return db.prepare(
+      `SELECT origin, destination, loaded_miles, linehaul_cents, fsc_cents, date
+       FROM loads WHERE tenant_id = ? AND driver_id = ? AND status = 'delivered'`).all(tenantId, driverId);
+  }
   return db.prepare(
     `SELECT origin, destination, loaded_miles, linehaul_cents, fsc_cents, date
      FROM loads WHERE tenant_id = ? AND status = 'delivered'`).all(tenantId);

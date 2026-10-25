@@ -944,6 +944,32 @@ router.post('/analyzer/create', auth.requireRoles('owner', 'editor'),
     res.redirect(`/loads/${id}?ok=` + encodeURIComponent('Load created from analyzer.'));
   });
 
+// ----- driver load analyzer (driver role; own pay terms, own history) -----
+// Drivers who book their own loads run the numbers before they take one.
+// Pay math always uses the logged-in driver's own terms — the request's
+// driver_id, if any, is ignored. No load creation from this page.
+router.get('/driver/analyzer', auth.requireRoles('driver'), (req, res) => {
+  if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
+  res.send(v.driverAnalyzerPage(req.user, req.query));
+});
+
+router.get('/driver/analyzer/data', auth.requireRoles('driver'), async (req, res) => {
+  if (!req.user.driver_id) return res.status(403).json({ ok: false, error: 'No driver linked to this login.' });
+  const q = req.query;
+  const ctx = {
+    driver: db.getDriver(req.user.driver_id) || null,
+    fuelNear: (lat, lon) => db.nearestFuelStops(lat, lon, 60, 1, T())[0] || null,
+    historyLoads: db.deliveredLoadsLite(T(), req.user.driver_id),
+  };
+  const out = await AZ.analyze({
+    origin: q.origin, destination: q.destination, rate: q.rate,
+    truckFrom: q.truckFrom, deadheadOverride: q.deadheadOverride,
+    mpg: q.mpg, fuelPrice: q.fuelPrice, fixedPerDay: q.fixedPerDay,
+    backhaulRate: q.backhaulRate, pickupDate: q.pickupDate, deliveryDate: q.deliveryDate,
+  }, ctx);
+  res.json(out);
+});
+
 // Driver load detail — own loads only, with their documents.
 router.get('/driver/loads/:id', auth.requireRoles('driver'), (req, res) => {
   if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');

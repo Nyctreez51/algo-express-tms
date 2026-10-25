@@ -102,7 +102,7 @@ function navFor(user) {
 function tabbar(active) {
   const t = (href, label) =>
     `<a href="${href}" class="${active === href ? 'on' : ''}">${label}</a>`;
-  return `<nav class="tabbar">${t('/driver', '🏠<br>Home')}${t('/driver/loads', '🚛<br>My Loads')}${t('/driver/settlements', '💵<br>Pay')}</nav>`;
+  return `<nav class="tabbar">${t('/driver', '🏠<br>Home')}${t('/driver/loads', '🚛<br>My Loads')}${t('/driver/analyzer', '⚡<br>Analyzer')}${t('/driver/settlements', '💵<br>Pay')}</nav>`;
 }
 
 function layout({ title, user, body, active = '', bare = false }) {
@@ -642,10 +642,17 @@ go();
 <p style="margin:0"><b>🛡️ Your safety score</b></p>
 <p class="mut" style="margin:0">No safety score on file yet — scores update from Motive.</p>
 </div>`;
+  const analyzerCard = `
+<div class="card" style="margin-bottom:12px">
+<p style="margin:0 0 6px"><b>⚡ Load analyzer</b></p>
+<p class="mut" style="margin:0 0 8px">Booking your own load? Run the numbers first — it shows your truck cost per mile and tells you straight if the load is worth taking.</p>
+<p style="margin:0"><a class="btn" href="/driver/analyzer">Analyze a load</a></p>
+</div>`;
   const body = `
 <h1 style="font-size:20px">Hi, ${esc(user.driver_name || 'driver')} 👋</h1>
 <p class="mut" style="margin-bottom:12px">Week of ${esc(fmtWeekRange(s.weekStart))} · Fri–Thu</p>
 ${safetyCard}
+${analyzerCard}
 ${tripCard}
 ${fuelCard}
 <div class="grid bigstat">
@@ -694,6 +701,7 @@ function driverLoadDetail(user, load, docs) {
 <dt>Gross</dt><dd><b>${fmtMoney(gross)}</b></dd>
 <dt>Status</dt><dd style="text-align:left">${esc(load.status || '')}</dd>
 </dl></div>
+<p style="margin:12px 0"><a class="btn" href="/driver/analyzer?origin=${encodeURIComponent(load.origin || '')}&destination=${encodeURIComponent(load.destination || '')}&rate=${(((load.linehaul_cents || 0) + (load.fsc_cents || 0)) / 100).toFixed(2)}">⚡ Run this load through the analyzer</a></p>
 <h2>Documents</h2>
 ${docsTable(docs, { canManage: false, docBase: '/driver/documents' })}`;
   return layout({ title: 'Load detail', user, active: '/driver/loads', body });
@@ -989,6 +997,95 @@ E('az-go').addEventListener('click',function(){
   });
 }
 
+// ---------- driver load analyzer (driver role; own pay, own history) ----------
+// Same engine as the owner analyzer, but pay math always uses this driver's
+// own terms, lane history covers only their own delivered loads, and there
+// is no load creation from this page. The result spells out truck cost per
+// mile, the break-even rate, and a plain take-it-or-leave-it verdict.
+function driverAnalyzerPage(user, q) {
+  return layout({
+    title: 'Load analyzer', user, active: '/driver/analyzer',
+    body: `<h1>Load analyzer</h1>${flash(q)}
+<p class="mut" style="margin-bottom:12px">Run the numbers before you take a load. Type in what they're offering and it shows your truck cost per mile and tells you straight whether the load is worth taking. Uses your own pay terms, the 65¢ x loaded miles fuel surcharge rule, RXO fuel prices near the pickup, and $147/day fixed cost — all editable.</p>
+<form id="dazform" class="f card" onsubmit="return false">
+<div class="two">
+<div class="row"><label>Pickup (City, ST)</label><input id="daz-origin" placeholder="Rincon, GA" value="${esc(q.origin || '')}" required></div>
+<div class="row"><label>Drop-off (City, ST)</label><input id="daz-dest" placeholder="Adairsville, GA" value="${esc(q.destination || '')}" required></div>
+</div>
+<div class="row"><label>Rate offered ($ gross)</label><input id="daz-rate" type="number" step="0.01" min="0" placeholder="1424" value="${esc(q.rate || '')}" required></div>
+<div class="two">
+<div class="row"><label>Truck starts from (optional, for deadhead)</label><input id="daz-from" placeholder="Atlanta, GA"></div>
+<div class="row"><label>…or deadhead miles (manual)</label><input id="daz-dh" type="number" step="1" min="0" placeholder="auto"></div>
+</div>
+<div class="two">
+<div class="row"><label>Pickup date (optional)</label><input id="daz-pdate" type="date"></div>
+<div class="row"><label>Delivery date (optional)</label><input id="daz-ddate" type="date"></div>
+</div>
+<div class="two">
+<div class="row"><label>MPG</label><input id="daz-mpg" type="number" step="0.1" min="1" value="7.0"></div>
+<div class="row"><label>Fuel $/gal (blank = RXO near pickup)</label><input id="daz-fuel" type="number" step="0.001" min="0" placeholder="auto"></div>
+</div>
+<div class="two">
+<div class="row"><label>Fixed cost $/day</label><input id="daz-fixed" type="number" step="1" min="0" value="147"></div>
+<div class="row"><label>Backhaul rate from drop-off (optional)</label><input id="daz-back" type="number" step="0.01" min="0" placeholder="—"></div>
+</div>
+<button class="btn" id="daz-go" type="button">⚡ Analyze load</button>
+</form>
+<div id="daz-out" style="margin-top:14px"></div>
+<script>(function(){
+function E(id){return document.getElementById(id);}
+function escHtml(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function money(x){return '$'+Number(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function row(k,val){return '<div style="display:flex;justify-content:space-between;padding:3px 0"><span class="mut">'+k+'</span><b>'+val+'</b></div>';}
+E('daz-go').addEventListener('click',function(){
+  var qs=new URLSearchParams({
+    origin:E('daz-origin').value,destination:E('daz-dest').value,rate:E('daz-rate').value,
+    truckFrom:E('daz-from').value,deadheadOverride:E('daz-dh').value,
+    pickupDate:E('daz-pdate').value,deliveryDate:E('daz-ddate').value,mpg:E('daz-mpg').value,
+    fuelPrice:E('daz-fuel').value,fixedPerDay:E('daz-fixed').value,backhaulRate:E('daz-back').value});
+  var out=E('daz-out');out.innerHTML='<p class="mut">Analyzing…</p>';
+  fetch('/driver/analyzer/data?'+qs.toString()).then(function(r){return r.json();}).then(function(j){
+    if(!j.ok){out.innerHTML='<div class="card"><b>'+escHtml(j.error||'Something went wrong.')+'</b></div>';return;}
+    var vcolor=j.verdict==='Strong'?'#4ade80':j.verdict==='Workable'?'#a3e635':j.verdict==='Thin'?'#facc15':'#f87171';
+    var advice=j.verdict==='Strong'?'Good load — take it.':j.verdict==='Workable'?'Decent load — worth taking.':j.verdict==='Thin'?'Barely covers costs — only take it if it positions you well.':'Do not take it — this load loses money.';
+    var totalCost=j.fuel.cost+(j.driverPay?j.driverPay.amount:0)+j.fixed.cost;
+    var costTruck=j.truckMiles?totalCost/j.truckMiles:0;
+    var costLoaded=j.loadedMiles?totalCost/j.loadedMiles:0;
+    var h='<div class="card" style="margin-bottom:12px"><div style="display:flex;justify-content:space-between;align-items:baseline">'
+      +'<b style="font-size:17px">'+escHtml(j.origin)+' → '+escHtml(j.destination)+'</b>'
+      +'<span style="font-size:17px">NET <b style="color:'+vcolor+'">'+money(j.net)+'</b> · '+j.marginPct+'% · <b style="color:'+vcolor+'">'+j.verdict+'</b></span></div>'
+      +'<p style="margin:8px 0 0;font-size:16px"><b style="color:'+vcolor+'">'+advice+'</b></p>'
+      +row('Loaded miles',j.loadedMiles+' mi ('+(j.distanceSource==='road'?'road':'est.')+', '+j.driveHours+'h drive)')
+      +(j.deadheadMiles?row('Deadhead',(j.truckFrom?'from '+escHtml(j.truckFrom)+' · ':'')+j.deadheadMiles+' mi'):row('Deadhead','0 mi'))
+      +row('Rate / $ per mile',money(j.rate)+' · $'+j.rpmLoaded+'/loaded mi · $'+j.rpmTruck+'/truck mi')
+      +row('Linehaul / FSC split',money(j.linehaul)+' / '+money(j.fsc))
+      +row('Fuel',j.fuel.gallons+' gal @ $'+Number(j.fuel.price).toFixed(2)+' ('+escHtml(j.fuel.priceNote)+') = '+money(j.fuel.cost))
+      +(j.driverPay?row('Your pay — '+escHtml(j.driverName),money(j.driverPay.amount)+' <span class="mut">('+escHtml(j.driverPay.basis)+')</span>'):'')
+      +row('Fixed cost',j.fixed.days+' day(s) x $'+j.fixed.perDay+' = '+money(j.fixed.cost))
+      +row('Truck cost per mile','<span style="font-size:15px">$'+costTruck.toFixed(2)+'/truck mi · $'+costLoaded.toFixed(2)+'/loaded mi</span>')
+      +row('Break-even rate','<span style="font-size:15px">'+money(totalCost)+' gross to break even</span>')
+      +'</div>';
+    h+='<div class="card" style="margin-bottom:12px"><b>Feasibility</b><p style="margin:6px 0 0">'+escHtml(j.feasibility.label)
+      +' · driving needed '+j.feasibility.driveHours+'h'+(j.feasibility.windowHours?' · window '+j.feasibility.windowHours+'h':'')+'</p></div>';
+    if(j.roundTrip){var t=j.roundTrip;
+      h+='<div class="card" style="margin-bottom:12px"><b>Round trip with backhaul</b>'
+        +row('Backhaul',money(t.backhaulRate)+' ('+money(t.linehaul)+' linehaul / '+money(t.fsc)+' FSC)')
+        +row('Round-trip miles',t.roundTripMiles+' mi · revenue '+money(t.revenue)+' · $'+t.rpm+'/mi')
+        +row('Fuel / driver / fixed',money(t.fuelCost)+' / '+money(t.driverPay)+' / '+money(t.fixedCost))
+        +row('Round-trip NET','<span style="font-size:15px">'+money(t.net)+'</span>')+'</div>';}
+    var hs=j.history;
+    h+='<div class="card"><b>Your lane history — '+escHtml(hs.statePair)+'</b><p style="margin:6px 0 0">'
+      +(hs.count?hs.count+' of your completed load(s) on this state pair'+(hs.exactCount?' ('+hs.exactCount+' exact city pair)':'')
+        +' · avg gross '+money(hs.avgGross)+(hs.avgRpm?' · avg $'+hs.avgRpm+'/mi':'')+' · last ran '+escHtml(hs.lastDate)
+        :'First time on this state pair — no completed loads yet. Every load you deliver builds your rate memory.')
+      +'</p></div>';
+    out.innerHTML=h;
+  }).catch(function(){out.innerHTML='<div class="card"><b>Analyzer unreachable — check connection and retry.</b></div>';});
+});
+})();</script>`,
+  });
+}
+
 // ---------- performance report + fuel dashboard (owner/editor/viewer) ----------
 function presetLinks(presets, base) {
   return `<p class="mut" style="margin:0 0 12px">Quick ranges: ${presets.map(p =>
@@ -1092,7 +1189,7 @@ module.exports = {
   expensesPage, expenseForm,
   settlementsPage, driversPage, driverForm, escrowPage, trucksPage, truckForm,
   usersPage, apiDocsPage,
-  driverHome, driverLoads, driverLoadDetail, driverSettlements,
+  driverHome, driverLoads, driverLoadDetail, driverSettlements, driverAnalyzerPage,
   fleetPage, rateconPage, fuelPage, analyzerPage,
   performancePage, fuelDashboardPage,
 };
