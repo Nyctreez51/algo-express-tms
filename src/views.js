@@ -83,6 +83,7 @@ function navFor(user) {
     + link('/fuel', 'Fuel', '/fuel')
     + link('/fuel-dashboard', 'Fuel dashboard', '/fuel-dashboard')
     + link('/performance', 'Performance', '/performance')
+    + link('/brokers', 'Brokers', '/brokers')
     + link('/analyzer', 'Analyzer', '/analyzer')
     + link('/ratecon', 'Rate con', '/ratecon')
     + link('/loads', 'Loads', '/loads')
@@ -540,6 +541,40 @@ ${['active', 'inactive', 'shop'].map(s => `<option ${t.status === s ? 'selected'
 }
 
 // Per-truck weekly mileage + gross with net, and a YTD summary per truck.
+// Book of Brokers (Tree, Nov 10 2026): companies + individual contacts from
+// db.brokerBook — load counts per company come from loads.broker; a contact's
+// count covers only loads whose record names that person (never fabricated).
+function brokersPage(user, companies) {
+  const totalCompanies = companies.length;
+  const totalContacts = companies.reduce((n, c) => n + c.contacts.length, 0);
+  const totalLoads = companies.reduce((n, c) => n + c.loads, 0);
+  const cards = `<div class="cards">`
+    + statCard('Broker companies', totalCompanies)
+    + statCard('Individual contacts', totalContacts)
+    + statCard('Loads on record', totalLoads)
+    + `</div>`;
+  const sections = companies.map(c => {
+    const rows = c.contacts.length
+      ? c.contacts.map(k => `<tr>
+          <td>${esc(k.contact_name)}${k.in_book ? '' : ' <span class="mut">(from load records)</span>'}</td>
+          <td>${k.email ? `<a href="mailto:${esc(k.email)}">${esc(k.email)}</a>` : '<span class="mut">—</span>'}</td>
+          <td>${k.phone ? esc(k.phone) : '<span class="mut">—</span>'}</td>
+          <td class="num">${k.loads || '<span class="mut">—</span>'}</td>
+        </tr>`).join('')
+      : `<tr><td colspan="4" class="mut">No individual contact on file yet — company-level loads only.</td></tr>`;
+    return `<h2 style="margin-top:26px">${esc(c.company)} <span class="mut" style="font-size:14px">· ${c.loads} load${c.loads === 1 ? '' : 's'}</span></h2>
+<div class="tblwrap"><table>
+<thead><tr><th>Contact</th><th>Email</th><th>Phone</th><th class="num">Loads</th></tr></thead>
+<tbody>${rows}</tbody></table></div>`;
+  }).join('');
+  return layout({ title: 'Book of Brokers', user, active: '/brokers',
+    body: `<h1>Book of Brokers</h1>${cards}
+<p class="mut">Carrier-packet references and broker outreach pull from this list. It updates
+automatically: every load saved with a broker contact adds or refreshes that contact here.
+Load counts per company come from all loads on file; a contact's count covers only the loads
+whose record names that person.</p>${sections || '<p class="mut">No brokers on file yet.</p>'}` });
+}
+
 // Weeks are settlement weeks (Fri–Thu) on a pickup-date basis; YTD is the
 // current calendar year, also pickup-date basis (computed in routes.js).
 // Net = gross − driver pay − fuel − insurance − maintenance − factoring −
@@ -1295,6 +1330,7 @@ module.exports = {
   dashboardPage, loadsPage, loadForm, loadDetailPage,
   expensesPage, expenseForm,
   settlementsPage, driversPage, driverForm, escrowPage, trucksPage, truckForm, truckWeeklyPage,
+  brokersPage,
   usersPage, apiDocsPage,
   driverHome, driverLoads, driverLoadDetail, driverSettlements, driverAnalyzerPage,
   fleetPage, rateconPage, fuelPage, analyzerPage,

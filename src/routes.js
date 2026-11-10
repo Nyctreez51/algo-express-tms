@@ -152,12 +152,17 @@ function resolveDriverId(tenantId, ref) {
   return d ? d.id : null;
 }
 function resolveTruckId(tenantId, ref) {
-  if (!ref) return null;
-  if (/^\d+$/.test(String(ref))) {
-    const t = db.getTruck(Number(ref), tenantId);
-    return t ? t.id : null;
+  if (ref == null || ref === '') return null;
+  const s = String(ref).trim();
+  if (/^\d+$/.test(s)) {
+    const t = db.getTruck(Number(s), tenantId);
+    if (t) return t.id;
+    // Unit numbers are numeric too ('5107', '5105', ...). The old code
+    // returned null here without trying the unit match, so every load
+    // synced with a unit string landed truck-less (blank Truck Weeks).
+    // Fall through to the unit-number lookup.
   }
-  const t = db.findTruckByUnit(String(ref).trim(), tenantId);
+  const t = db.findTruckByUnit(s, tenantId);
   return t ? t.id : null;
 }
 
@@ -176,6 +181,10 @@ router.post('/api/v1/loads/upsert', apiAuth, express.json(), (req, res) => {
     linehaul_cents: toCents(b.linehaul),
     fsc_cents: toCents(b.fuel_surcharge),
     broker: b.broker || null,
+    // Book of Brokers: undefined = leave stored contact info untouched.
+    broker_contact_name: b.broker_contact_name !== undefined ? (b.broker_contact_name || null) : undefined,
+    broker_contact_email: b.broker_contact_email !== undefined ? (b.broker_contact_email || null) : undefined,
+    broker_contact_phone: b.broker_contact_phone !== undefined ? (b.broker_contact_phone || null) : undefined,
     driver_id: resolveDriverId(req.tenantId, b.driver ?? b.driver_id),
     truck_id: resolveTruckId(req.tenantId, b.truck ?? b.truck_id),
     status: b.status || 'delivered',
@@ -229,6 +238,87 @@ router.post('/api/v1/positions/upsert', apiAuth, express.json(), (req, res) => {
     n++;
   }
   res.json({ ok: true, upserted: n });
+});
+
+// ---------- fleet-admin sync API (X-API-Key): drivers, trucks, brokers ----------
+// Same auth pattern as the loads/expenses/positions sync above. Upserts merge
+// with the existing row (matched by driver name / truck unit / broker
+// company+contact) so a partial payload never wipes known fields.
+router.get('/api/v1/drivers', apiAuth, (req, res) => {
+  res.json({ ok: true, drivers: db.listDrivers(req.tenantId) });
+});
+router.post('/api/v1/drivers/upsert', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim();
+  if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+  const ex = db.findDriverByName(name, req.tenantId);
+  const id = db.saveDriver({
+    id: ex ? ex.id : undefined,
+    name,
+    phone: b.phone !== undefined ? b.phone : (ex ? ex.phone : null),
+    pay_pct: b.pay_pct !== undefined ? toNum(b.pay_pct, 30) : (ex ? ex.pay_pct : 30),
+    pay_type: b.pay_type || (ex ? ex.pay_type : 'percent'),
+    pay_rate: b.pay_rate !== undefined ? toNum(b.pay_rate, null) : (ex ? ex.pay_rate : null),
+    status: b.status || (ex ? ex.status : 'active'),
+    notes: b.notes !== undefined ? b.notes : (ex ? ex.notes : null),
+  }, req.tenantId);
+  res.json({ ok: true, id, updated: !!ex, driver: db.getDriver(id, req.tenantId) });
+});
+
+router.get('/api/v1/trucks', apiAuth, (req, res) => {
+  res.json({ ok: true, trucks: db.listTrucks(req.tenantId) });
+});
+router.post('/api/v1/trucks/upsert', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  let ex = null;
+  if (b.id) ex = db.getTruck(Number(b.id), req.tenantId);
+  else if (b.unit_number) ex = db.findTruckByUnit(String(b.unit_number).trim(), req.tenantId);
+  if (!ex && !b.unit_number) {
+    return res.status(400).json({ ok: false, error: 'unit_number (or id) is required' });
+  }
+  const pick = (k, fb) => (b[k] !== undefined ? b[k] : (ex ? ex[k] : fb));
+  const id = db.saveTruck({
+    id: ex ? ex.id : undefined,
+    unit_number: pick('unit_number', null),
+    year: pick('year', null), make: pick('make', null), model: pick('model', null),
+    vin: pick('vin', null), type: pick('type', 'tractor'),
+    trailer_desc: pick('trailer_desc', null),
+    status: pick('status', 'active'), notes: pick('notes', null),
+  }, req.tenantId);
+  res.json({ ok: true, id, updated: !!ex, truck: db.getTruck(id, req.tenantId) });
+});
+router.post('/api/v1/trucks/delete', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  const t = b.id ? db.getTruck(Number(b.id), req.tenantId)
+    : (b.unit_number ? db.findTruckByUnit(String(b.unit_number).trim(), req.tenantId) : null);
+  if (!t) return res.status(404).json({ ok: false, error: 'truck not found' });
+  db.deleteTruck(t.id, req.tenantId);
+  res.json({ ok: true, deleted: t.id });
+});
+router.get('/api/v1/trucks/weekly', apiAuth, (req, res) => {
+  res.json({ ok: true, trucks: truckWeeklyRollup() });
+});
+router.get('/api/v1/positions', apiAuth, (req, res) => {
+  res.json({ ok: true, positions: db.listMotivePositions(req.tenantId) });
+});
+router.get('/api/v1/expenses', apiAuth, (req, res) => {
+  res.json({ ok: true, expenses: db.listExpenses(req.tenantId, { limit: 2000 }) });
+});
+
+router.get('/api/v1/brokers', apiAuth, (req, res) => {
+  res.json({ ok: true, brokers: db.brokerBook(req.tenantId) });
+});
+router.post('/api/v1/brokers/upsert', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  if (!String(b.company || '').trim()) {
+    return res.status(400).json({ ok: false, error: 'company is required' });
+  }
+  const r = db.upsertBroker({
+    company: b.company,
+    contact_name: b.contact_name !== undefined ? b.contact_name : (b.name || null),
+    email: b.email || null, phone: b.phone || null, notes: b.notes || null,
+  }, req.tenantId);
+  res.json({ ok: true, id: r.id, updated: r.updated });
 });
 
 // ---------- everything below needs a login ----------
@@ -529,6 +619,14 @@ router.get('/performance', auth.requireRoles('owner', 'editor', 'viewer'), (req,
   res.send(v.performancePage(req.user, d, req.query, db.listDrivers(), db.listTrucks(), reportPresets()));
 });
 
+// Book of Brokers (Tree, Nov 10 2026): every broker company + the individual
+// contacts who gave us loads, with load counts. Carrier-packet references
+// and broker outreach pull from here; the book updates itself whenever a
+// load is saved with contact info (see db.recordBrokerContact).
+router.get('/brokers', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  res.send(v.brokersPage(req.user, db.brokerBook(T())));
+});
+
 router.get('/fuel-dashboard', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
   const d = perf.fuelDashboard(req.query);
   res.send(v.fuelDashboardPage(req.user, d, req.query, reportPresets()));
@@ -536,8 +634,11 @@ router.get('/fuel-dashboard', auth.requireRoles('owner', 'editor', 'viewer'), (r
 
 // ----- drivers -----
 router.get('/drivers', auth.canEdit, (req, res) => {
-  const drivers = db.listDrivers().map(d => ({ ...d, escrow_balance: db.escrowBalance(d.id),
-    safety: db.latestSafetyScore(d.id) }));
+  // Active drivers only (Tree, Nov 10 2026): former drivers keep their rows
+  // and load history but no longer show in the portal's driver list.
+  const drivers = db.listDrivers().filter(d => d.status === 'active')
+    .map(d => ({ ...d, escrow_balance: db.escrowBalance(d.id),
+      safety: db.latestSafetyScore(d.id) }));
   res.send(v.driversPage(req.user, drivers, req.query));
 });
 router.get('/drivers/new', auth.canEdit, (req, res) => {
@@ -682,7 +783,10 @@ function truckWeeklyRollup() {
     }
     return groups.get(t.id);
   };
-  for (const t of db.listTrucks(T())) groupFor(t);
+  // Only ACTIVE trucks get a rollup card (Tree, Nov 10 2026). Loads/expenses
+  // for an inactive or removed truck fall into the Unassigned bucket below —
+  // never silently dropped.
+  for (const t of db.listTrucks(T())) if (t.status === 'active') groupFor(t);
   const unassigned = { id: null, label: 'Unassigned', desc: '', type: 'tractor', status: '',
     insured: false, weeks: new Map(), ytdWeeks: new Set() };
   let hasUnassigned = false;
@@ -696,8 +800,7 @@ function truckWeeklyRollup() {
      WHERE l.tenant_id = ?`
   ).all(T());
   for (const l of loads) {
-    const g = l.truck_id != null ? groups.get(l.truck_id) : unassigned;
-    if (!g) continue; // defensive: load points at a truck row that is gone
+    const g = (l.truck_id != null && groups.get(l.truck_id)) || unassigned;
     if (g === unassigned) hasUnassigned = true;
     const f = loadPayAndFees(l);
     const ws = D.weekStartOf(l.date);
@@ -724,10 +827,10 @@ function truckWeeklyRollup() {
      GROUP BY truck_id, date, category`
   ).all(T());
   for (const r of expRows) {
-    const g = groups.get(r.truck_id);
-    if (!g) continue;
+    const g = groups.get(r.truck_id) || unassigned;
     const w = g.weeks.get(D.weekStartOf(r.date));
     if (!w) continue; // expense in a week with no loads for this truck
+    if (g === unassigned) hasUnassigned = true;
     if (r.category === 'fuel') { w.fuel_cents += r.amt_cents; w.fuel_rows += r.n; }
     else w.maintenance_cents += r.amt_cents;
   }

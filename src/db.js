@@ -84,12 +84,30 @@ CREATE TABLE IF NOT EXISTS loads (
   linehaul_cents INTEGER NOT NULL DEFAULT 0,
   fsc_cents      INTEGER NOT NULL DEFAULT 0,
   broker         TEXT,
+  broker_contact_name  TEXT,               -- individual at the broker who gave us the load
+  broker_contact_email TEXT,
+  broker_contact_phone TEXT,
   driver_id      INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
   truck_id       INTEGER REFERENCES trucks(id) ON DELETE SET NULL,
   status         TEXT NOT NULL DEFAULT 'delivered',
   notes          TEXT,
   created_at     TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (tenant_id, external_id)
+);
+
+-- Book of Brokers (Tree, Nov 10 2026): one row per broker company +
+-- individual contact. Carrier-packet references and broker outreach pull
+-- from here. Loads saved with contact info upsert a row automatically
+-- (see recordBrokerContact), so the book stays current on every upload.
+CREATE TABLE IF NOT EXISTS brokers (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id    TEXT NOT NULL,
+  company      TEXT NOT NULL,
+  contact_name TEXT,
+  email        TEXT,
+  phone        TEXT,
+  notes        TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Live trip tracking (driver phone GPS; Path 1: web-based, while page is open).
@@ -284,6 +302,11 @@ function migrate() {
   if (!ucols.includes('last_login_at')) db.exec(`ALTER TABLE users ADD COLUMN last_login_at TEXT`);
   if (!ucols.includes('failed_login_count')) db.exec(`ALTER TABLE users ADD COLUMN failed_login_count INTEGER NOT NULL DEFAULT 0`);
   if (!ucols.includes('last_failed_at')) db.exec(`ALTER TABLE users ADD COLUMN last_failed_at TEXT`);
+  // Broker contact fields on loads (Book of Brokers, Nov 10 2026).
+  const lcols = db.prepare(`PRAGMA table_info(loads)`).all().map(c => c.name);
+  if (!lcols.includes('broker_contact_name')) db.exec(`ALTER TABLE loads ADD COLUMN broker_contact_name TEXT`);
+  if (!lcols.includes('broker_contact_email')) db.exec(`ALTER TABLE loads ADD COLUMN broker_contact_email TEXT`);
+  if (!lcols.includes('broker_contact_phone')) db.exec(`ALTER TABLE loads ADD COLUMN broker_contact_phone TEXT`);
   const scols = db.prepare(`PRAGMA table_info(sessions)`).all().map(c => c.name);
   // NOTE: plain nullable column on purpose — SQLite's ALTER TABLE rejects
   // expression defaults like (datetime('now')) on some builds, which crashed
@@ -534,6 +557,10 @@ function findTruckByUnit(unitNumber, tenantId = TENANT) {
   return db.prepare('SELECT * FROM trucks WHERE tenant_id = ? AND unit_number = ?')
     .get(tenantId, unitNumber);
 }
+function deleteTruck(id, tenantId = TENANT) {
+  // loads/expenses keep their history — their truck_id goes NULL (FK SET NULL).
+  db.prepare('DELETE FROM trucks WHERE id = ? AND tenant_id = ?').run(id, tenantId);
+}
 
 // ---- Drivers ----
 function listDrivers(tenantId = TENANT) {
@@ -594,25 +621,50 @@ function getLoad(id, tenantId = TENANT) {
   return db.prepare('SELECT * FROM loads WHERE id = ? AND tenant_id = ?').get(id, tenantId);
 }
 function saveLoad(l, tenantId = TENANT) {
+  // Broker contact fields: callers that don't know about them (web forms)
+  // leave them undefined on updates — preserve what's already stored then,
+  // so editing a load in the UI never wipes contact info the API recorded.
+  let bcName = l.broker_contact_name, bcEmail = l.broker_contact_email, bcPhone = l.broker_contact_phone;
+  if (l.id && (bcName === undefined || bcEmail === undefined || bcPhone === undefined)) {
+    const ex = db.prepare('SELECT broker_contact_name, broker_contact_email, broker_contact_phone FROM loads WHERE id = ? AND tenant_id = ?')
+      .get(l.id, tenantId);
+    if (ex) {
+      if (bcName === undefined) bcName = ex.broker_contact_name;
+      if (bcEmail === undefined) bcEmail = ex.broker_contact_email;
+      if (bcPhone === undefined) bcPhone = ex.broker_contact_phone;
+    }
+  }
+  let id;
   if (l.id) {
     db.prepare(`UPDATE loads SET date=?, origin=?, destination=?, loaded_miles=?, empty_miles=?,
-      linehaul_cents=?, fsc_cents=?, broker=?, driver_id=?, truck_id=?, status=?, notes=?
+      linehaul_cents=?, fsc_cents=?, broker=?, broker_contact_name=?, broker_contact_email=?,
+      broker_contact_phone=?, driver_id=?, truck_id=?, status=?, notes=?
       WHERE id=? AND tenant_id=?`)
       .run(l.date, l.origin || null, l.destination || null, l.loaded_miles || 0,
         l.empty_miles || 0, l.linehaul_cents || 0, l.fsc_cents || 0, l.broker || null,
+        bcName || null, bcEmail || null, bcPhone || null,
         l.driver_id || null, l.truck_id || null, l.status || 'delivered', l.notes || null,
         l.id, tenantId);
-    return l.id;
+    id = l.id;
+  } else {
+    const r = db.prepare(`INSERT INTO loads
+      (tenant_id, external_id, date, origin, destination, loaded_miles, empty_miles,
+       linehaul_cents, fsc_cents, broker, broker_contact_name, broker_contact_email,
+       broker_contact_phone, driver_id, truck_id, status, notes)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(tenantId, l.external_id || null, l.date, l.origin || null, l.destination || null,
+        l.loaded_miles || 0, l.empty_miles || 0, l.linehaul_cents || 0, l.fsc_cents || 0,
+        l.broker || null, bcName || null, bcEmail || null, bcPhone || null,
+        l.driver_id || null, l.truck_id || null,
+        l.status || 'delivered', l.notes || null);
+    id = r.lastInsertRowid;
   }
-  const r = db.prepare(`INSERT INTO loads
-    (tenant_id, external_id, date, origin, destination, loaded_miles, empty_miles,
-     linehaul_cents, fsc_cents, broker, driver_id, truck_id, status, notes)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(tenantId, l.external_id || null, l.date, l.origin || null, l.destination || null,
-      l.loaded_miles || 0, l.empty_miles || 0, l.linehaul_cents || 0, l.fsc_cents || 0,
-      l.broker || null, l.driver_id || null, l.truck_id || null,
-      l.status || 'delivered', l.notes || null);
-  return r.lastInsertRowid;
+  // Book of Brokers auto-update: a load saved with an individual contact
+  // keeps that contact's book entry current (new company, new person at a
+  // known company, or fresher email/phone).
+  recordBrokerContact({ broker: l.broker, broker_contact_name: bcName,
+    broker_contact_email: bcEmail, broker_contact_phone: bcPhone }, tenantId);
+  return id;
 }
 function upsertLoad(l, tenantId = TENANT) {
   if (l.external_id) {
@@ -624,6 +676,102 @@ function upsertLoad(l, tenantId = TENANT) {
 }
 function deleteLoad(id, tenantId = TENANT) {
   db.prepare('DELETE FROM loads WHERE id = ? AND tenant_id = ?').run(id, tenantId);
+}
+
+// ---- Book of Brokers ----
+// Company matching is deliberately forgiving (broker strings on loads vary:
+// "Falcon Transportation" vs "Falcon Transportation LLC"): normalize case and
+// punctuation, then match exact or one-side-prefix. Counts come from loads
+// only — a contact's load count counts loads whose record names that person.
+function normCompany(s) {
+  return String(s || '').toLowerCase().replace(/&/g, ' and ')
+    .replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function sameCompany(a, b) {
+  const x = normCompany(a), y = normCompany(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  const shorter = x.length <= y.length ? x : y;
+  const longer = x.length <= y.length ? y : x;
+  return shorter.length >= 4 && longer.startsWith(shorter + ' ');
+}
+function listBrokers(tenantId = TENANT) {
+  return db.prepare('SELECT * FROM brokers WHERE tenant_id = ? ORDER BY company, contact_name')
+    .all(tenantId);
+}
+function findBroker(company, contactName, tenantId = TENANT) {
+  return db.prepare(`SELECT * FROM brokers WHERE tenant_id = ?
+    AND LOWER(company) = LOWER(?) AND LOWER(COALESCE(contact_name, '')) = LOWER(?)`)
+    .get(tenantId, String(company || '').trim(), String(contactName || '').trim());
+}
+function upsertBroker(b, tenantId = TENANT) {
+  const company = String(b.company || '').trim();
+  if (!company) return null;
+  const name = b.contact_name != null ? (String(b.contact_name).trim() || null) : null;
+  const ex = findBroker(company, name, tenantId);
+  if (ex) {
+    // Merge: a later sighting fills gaps but never erases known details.
+    db.prepare(`UPDATE brokers SET email = COALESCE(?, email), phone = COALESCE(?, phone),
+      notes = COALESCE(?, notes) WHERE id = ? AND tenant_id = ?`)
+      .run(b.email || null, b.phone || null, b.notes || null, ex.id, tenantId);
+    return { id: ex.id, updated: true };
+  }
+  const r = db.prepare(`INSERT INTO brokers (tenant_id, company, contact_name, email, phone, notes)
+    VALUES (?,?,?,?,?,?)`)
+    .run(tenantId, company, name, b.email || null, b.phone || null, b.notes || null);
+  return { id: r.lastInsertRowid, updated: false };
+}
+// Called from saveLoad: keep the book current whenever a load names the
+// individual who gave us the load.
+function recordBrokerContact(l, tenantId = TENANT) {
+  const company = String(l.broker || '').trim();
+  const name = String(l.broker_contact_name || '').trim();
+  if (!company || !name) return;
+  upsertBroker({ company, contact_name: name,
+    email: l.broker_contact_email || null, phone: l.broker_contact_phone || null }, tenantId);
+}
+// The book as the Brokers page / API present it: every company from the
+// brokers table plus every broker string on loads, with per-company load
+// counts and per-contact counts (only where load records name the person).
+function brokerBook(tenantId = TENANT) {
+  const rows = listBrokers(tenantId);
+  const loadRows = db.prepare(
+    `SELECT broker, broker_contact_name, COUNT(*) AS n FROM loads
+     WHERE tenant_id = ? AND broker IS NOT NULL AND TRIM(broker) <> ''
+     GROUP BY broker, broker_contact_name`).all(tenantId);
+  const companies = [];
+  const groupFor = (display) => {
+    let g = companies.find(c => sameCompany(c.company, display));
+    if (!g) { g = { company: display, loads: 0, contacts: [] }; companies.push(g); }
+    return g;
+  };
+  for (const r of rows) {
+    const g = groupFor(r.company);
+    if (r.contact_name && !g.contacts.some(c => c.contact_name
+      && c.contact_name.toLowerCase() === r.contact_name.toLowerCase())) {
+      g.contacts.push({ id: r.id, contact_name: r.contact_name, email: r.email,
+        phone: r.phone, notes: r.notes, loads: 0, in_book: true });
+    }
+  }
+  for (const lr of loadRows) {
+    const g = groupFor(lr.broker);
+    g.loads += lr.n;
+    if (lr.broker_contact_name) {
+      let c = g.contacts.find(x => x.contact_name
+        && x.contact_name.toLowerCase() === lr.broker_contact_name.toLowerCase());
+      if (!c) {
+        c = { id: null, contact_name: lr.broker_contact_name, email: null, phone: null,
+          notes: null, loads: 0, in_book: false };
+        g.contacts.push(c);
+      }
+      c.loads += lr.n;
+    }
+  }
+  for (const g of companies) {
+    g.contacts.sort((a, b) => String(a.contact_name).localeCompare(String(b.contact_name)));
+  }
+  companies.sort((a, b) => a.company.localeCompare(b.company, 'en', { numeric: true }));
+  return companies;
 }
 
 // ---- Expenses ----
@@ -853,8 +1001,9 @@ module.exports = {
   userCount, findUserByEmail, findUserById, createUser, listUsers, setUserActive,
   newSessionToken, createSession, getSession, deleteSession,
   getCompany,
-  listTrucks, getTruck, saveTruck, findTruckByUnit,
+  listTrucks, getTruck, saveTruck, findTruckByUnit, deleteTruck,
   listDrivers, getDriver, findDriverByName, saveDriver,
+  listBrokers, findBroker, upsertBroker, recordBrokerContact, brokerBook,
   safetyGrade, latestSafetyScore, saveSafetyScore,
   listLoads, getLoad, saveLoad, upsertLoad, deleteLoad,
   listExpenses, getExpense, saveExpense, upsertExpense, deleteExpense,
