@@ -87,7 +87,8 @@ function navFor(user) {
     + link('/ratecon', 'Rate con', '/ratecon')
     + link('/loads', 'Loads', '/loads')
     + link('/expenses', 'Expenses', '/expenses')
-    + link('/settlements', 'Settlements', '/settlements');
+    + link('/settlements', 'Settlements', '/settlements')
+    + link('/trucks/weekly', 'Truck weeks', '/trucks/weekly');
   if (r === 'owner' || r === 'editor') {
     links += link('/drivers', 'Drivers', '/drivers') + link('/trucks', 'Trucks', '/trucks');
   }
@@ -536,6 +537,75 @@ ${['active', 'inactive', 'shop'].map(s => `<option ${t.status === s ? 'selected'
 <div class="row"><label>Notes</label><textarea name="notes" rows="2">${esc(t.notes || '')}</textarea></div>
 <button class="btn">Save unit</button>
 <a class="btn ghost" href="/trucks" style="margin-left:8px">Cancel</a></form>`;
+}
+
+// Per-truck weekly mileage + gross with net, and a YTD summary per truck.
+// Weeks are settlement weeks (Fri–Thu) on a pickup-date basis; YTD is the
+// current calendar year, also pickup-date basis (computed in routes.js).
+// Net = gross − driver pay − fuel − insurance − maintenance − factoring −
+// dispatch. Fuel shows its basis (actual recorded expenses vs estimate);
+// factoring/dispatch cells show the accounts/buckets behind the fee.
+function truckWeeklyPage(user, trucks) {
+  const factLabel = (a) => {
+    const p = [];
+    if (a.qap) p.push('QAP 2.0%');
+    if (a.nonrec) p.push('NONREC 2.7%');
+    if (a.none) p.push('not factored');
+    return p.join(' · ');
+  };
+  const dispLabel = (b) => {
+    const p = [];
+    if (b.erica.loads) p.push('Erica 7%');
+    if (b.hybrid.loads) p.push('Hybrid 3%');
+    if (b.none.loads) p.push('self 0%');
+    return p.join(' · ');
+  };
+  const sub = (txt) => txt ? `<div class="mut" style="font-size:11px">${esc(txt)}</div>` : '';
+  const sections = trucks.map(g => {
+    const y = g.ytd;
+    const rows = g.weeks.map(w => `<tr><td>${esc(fmtWeekRange(w.week_start))}</td>
+<td class="num">${w.loads}</td><td class="num">${fmtNum(w.loaded_miles)}</td>
+<td class="num">${fmtNum(w.empty_miles)}</td><td class="num">${fmtNum(w.total_miles)}</td>
+<td class="num">${fmtMoney(w.gross_cents)}</td>
+<td class="num">${fmtMoney(w.pay_cents)}${w.net_partial ? sub(`pay partial — ${w.pay_unknown_loads} load(s) w/o pay basis`) : ''}</td>
+<td class="num">${fmtMoney(w.fuel_cents)}${sub(w.fuel_basis)}</td>
+<td class="num">${fmtMoney(w.insurance_cents)}</td>
+<td class="num">${fmtMoney(w.maintenance_cents)}</td>
+<td class="num">${fmtMoney(w.factoring_cents)}${sub(factLabel(w.factoring_accts))}</td>
+<td class="num">${fmtMoney(w.dispatch_cents)}${sub(dispLabel(w.dispatch_buckets))}</td>
+<td class="num"><b>${fmtMoney(w.net_cents)}</b></td></tr>`).join('');
+    const table = g.weeks.length ? `<div class="tblwrap"><table style="min-width:1180px">
+<tr><th>Week (Fri–Thu)</th><th class="num">Loads</th><th class="num">Loaded mi</th><th class="num">Empty mi</th><th class="num">Total mi</th><th class="num">Gross</th><th class="num">Driver pay</th><th class="num">Fuel</th><th class="num">Insurance</th><th class="num">Maint.</th><th class="num">Factoring</th><th class="num">Dispatch</th><th class="num">Net</th></tr>
+${rows}
+<tr><td><b>${esc(y.year)} year to date</b></td><td class="num"><b>${y.loads}</b></td>
+<td class="num"><b>${fmtNum(y.loaded_miles)}</b></td><td class="num"><b>${fmtNum(y.empty_miles)}</b></td>
+<td class="num"><b>${fmtNum(y.total_miles)}</b></td><td class="num"><b>${fmtMoney(y.gross_cents)}</b></td>
+<td class="num"><b>${fmtMoney(y.pay_cents)}</b></td><td class="num"><b>${fmtMoney(y.fuel_cents)}</b></td>
+<td class="num"><b>${fmtMoney(y.insurance_cents)}</b></td><td class="num"><b>${fmtMoney(y.maintenance_cents)}</b></td>
+<td class="num"><b>${fmtMoney(y.factoring_cents)}</b></td><td class="num"><b>${fmtMoney(y.dispatch_cents)}</b></td>
+<td class="num"><b>${fmtMoney(y.net_cents)}</b></td></tr>
+</table></div>` : '<p class="mut">No loads recorded for this unit yet.</p>';
+    return `<h2>Truck ${esc(g.label)}${g.desc ? ` <span class="mut" style="font-size:13px;font-weight:400">${esc(g.desc)}</span>` : ''}</h2>
+<div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:12px">
+${statCard(`${y.year} gross`, fmtMoney(y.gross_cents), `${y.loads} loads · ${fmtNum(y.total_miles)} mi (${fmtNum(y.loaded_miles)} loaded · ${fmtNum(y.empty_miles)} empty) YTD`)}
+${statCard(`${y.year} net for ALGO`, fmtMoney(y.net_cents), 'after pay, fuel, insurance, maintenance, factoring, dispatch')}
+</div>
+<div class="grid" style="margin-bottom:12px">
+${statCard('Driver pay', fmtMoney(y.pay_cents), y.net_partial ? `partial — ${y.pay_unknown_loads} load(s) w/o pay basis` : 'per driver terms')}
+${statCard('Fuel', fmtMoney(y.fuel_cents), y.fuel_basis === 'none' ? '—' : (y.fuel_basis === 'mixed' ? 'actual + estimated weeks' : y.fuel_basis))}
+${statCard('Insurance', fmtMoney(y.insurance_cents), '$3,000/mo allocation')}
+${statCard('Maintenance', fmtMoney(y.maintenance_cents), 'recorded expenses only')}
+${statCard('Factoring', fmtMoney(y.factoring_cents), factLabel(y.factoring_accts))}
+${statCard('Dispatch', fmtMoney(y.dispatch_cents), dispLabel(y.dispatch_buckets))}
+</div>
+${table}`;
+  }).join('');
+  return layout({
+    title: 'Truck weeks', user, active: '/trucks/weekly',
+    body: `<h1>Trucks — weekly mileage, gross &amp; net</h1>
+<p class="mut" style="margin-bottom:6px">Each truck's mileage and gross by settlement week (<b>Friday → Thursday</b>), by pickup date. Gross = linehaul + fuel surcharge. <b>Net</b> = gross − driver pay − fuel − insurance − maintenance − factoring − dispatch. Driver pay: per-mile rate × loaded miles, or pay % × linehaul. Fuel: recorded fuel expenses where the truck has them, otherwise estimated at total miles ÷ 6.5 mpg × $5.50/gal (marked <i>estimated</i>). Insurance: $3,000/month per-truck allocation ($692.31/week). Maintenance: recorded expenses only. Factoring: TQL → QAP 2.0% of gross, other brokers → NONRECOURSE 2.7%, unless the load record names an account. Dispatch: Erica 7% · Hybrid 3% · self-booked/RXO 0%, per the dispatcher the load record names. Year-to-date totals are the current calendar year, pickup-date basis.</p>
+${sections || '<p class="mut">No trucks yet.</p>'}`,
+  });
 }
 
 // ---------- users (owner) ----------
@@ -1224,7 +1294,7 @@ module.exports = {
   setupPage, loginPage,
   dashboardPage, loadsPage, loadForm, loadDetailPage,
   expensesPage, expenseForm,
-  settlementsPage, driversPage, driverForm, escrowPage, trucksPage, truckForm,
+  settlementsPage, driversPage, driverForm, escrowPage, trucksPage, truckForm, truckWeeklyPage,
   usersPage, apiDocsPage,
   driverHome, driverLoads, driverLoadDetail, driverSettlements, driverAnalyzerPage,
   fleetPage, rateconPage, fuelPage, analyzerPage,

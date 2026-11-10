@@ -598,6 +598,207 @@ router.post('/escrow/withhold-weekly', auth.canEdit, express.urlencoded({ extend
 });
 
 // ----- trucks -----
+// Per-truck weekly rollup + year-to-date totals, with net (read-only).
+// A load belongs to the settlement week (Fri–Thu) of its pickup date
+// (loads.date); the week math lives in dates.js. Gross = linehaul + FSC.
+// Net = gross − driver pay − fuel − insurance − maintenance − factoring −
+// dispatch ("what's left for ALGO" per truck), where:
+//  - driver pay is per load from the driver's own rule: per-mile rate ×
+//    loaded miles, or pay % × LINEHAUL (never gross). A load with no driver
+//    (or a per-mile driver with no rate) counts $0 pay and flags the
+//    truck-week's net as partial.
+//  - fuel is the truck's recorded fuel expenses for the week, or — when a
+//    truck-week has none recorded — an estimate at total miles ÷ 6.5 mpg ×
+//    $5.50/gal, flagged 'estimated';
+//  - insurance is Tree's $3,000/mo per-truck allocation = $692.31/week;
+//  - maintenance is the truck's recorded maintenance expenses ($0 if none);
+//  - factoring is per load at RTS rates: TQL broker → QAP 2.0% of gross,
+//    every other broker → NONRECOURSE 2.7% of gross. An explicit account
+//    marker in the load's notes (QAP / NONRECOURSE / not factored) wins
+//    over this routing default;
+//  - dispatch is per load from the dispatcher the record identifies:
+//    Erica / JB Solutions (incl. every dispatch-sheet load) 7% of gross,
+//    Hybrid Trucking 3%, otherwise 0% (Tree-booked, RXO dedicated, or no
+//    dispatcher recorded).
+// YTD sums the truck's weeks that contain at least one current-year pickup.
+function loadPayAndFees(l) {
+  const gross = (l.linehaul_cents || 0) + (l.fsc_cents || 0);
+  const notes = l.notes || '';
+
+  let pay_cents = 0, pay_unknown = false;
+  if (!l.driver_id) pay_unknown = true;
+  else if (l.pay_type === 'per_mile') {
+    if (l.pay_rate > 0) pay_cents = Math.round(l.loaded_miles * l.pay_rate * 100);
+    else pay_unknown = true;
+  } else {
+    pay_cents = Math.round((l.linehaul_cents || 0) * (l.pay_pct || 0) / 100);
+  }
+
+  const isTQL = (l.broker || '').trim().toUpperCase() === 'TQL';
+  const hasQAP = /\bqap\b/i.test(notes);
+  const hasNR = /nonrecourse/i.test(notes);
+  const notFactored = /not factored|no factoring|direct[- ]bill/i.test(notes);
+  let factoring_acct, factoring_marker = false;
+  if (notFactored) { factoring_acct = 'none'; factoring_marker = true; }
+  else if (hasQAP !== hasNR) { factoring_acct = hasQAP ? 'qap' : 'nonrec'; factoring_marker = true; }
+  else factoring_acct = isTQL ? 'qap' : 'nonrec';
+  const factoring_cents = factoring_acct === 'qap' ? Math.round(gross * 0.02)
+    : factoring_acct === 'nonrec' ? Math.round(gross * 0.027) : 0;
+
+  let dispatch_bucket = 'none';
+  if (/hybrid/i.test(notes)) dispatch_bucket = 'hybrid';
+  else if (/^dispatch sheet/i.test(notes)
+    || /dispatch\w*\s*:?\s*erica/i.test(notes)
+    || /erica[^.]{0,40}\b(dispatch|booked)\b/i.test(notes)
+    || /\bbooked by erica\b/i.test(notes)) dispatch_bucket = 'erica';
+  const dispatch_cents = dispatch_bucket === 'erica' ? Math.round(gross * 0.07)
+    : dispatch_bucket === 'hybrid' ? Math.round(gross * 0.03) : 0;
+
+  return { gross_cents: gross, pay_cents, pay_unknown,
+    factoring_cents, factoring_acct, factoring_marker,
+    dispatch_cents, dispatch_bucket };
+}
+
+function truckWeeklyRollup() {
+  const today = D.todayStr();
+  const ytdStart = D.yearStart(today);
+  const INS_WEEK_CENTS = 69231; // $3,000/mo allocation: 3000 × 12 / 52 = $692.31/wk
+  const blank = () => ({ loads: 0, loaded_miles: 0, empty_miles: 0, gross_cents: 0,
+    pay_cents: 0, pay_unknown_loads: 0, fuel_cents: 0, fuel_rows: 0, maintenance_cents: 0,
+    factoring_cents: 0, factoring_marker_loads: 0, factoring_default_loads: 0,
+    factoring_accts: { qap: 0, nonrec: 0, none: 0 },
+    dispatch_cents: 0,
+    dispatch_buckets: { erica: { loads: 0, gross_cents: 0 }, hybrid: { loads: 0, gross_cents: 0 }, none: { loads: 0, gross_cents: 0 } } });
+  const groups = new Map();
+  const groupFor = (t) => {
+    if (!groups.has(t.id)) {
+      groups.set(t.id, {
+        id: t.id,
+        label: t.unit_number || [t.year, t.make, t.model].filter(Boolean).join(' ') || `Unit ${t.id}`,
+        desc: t.unit_number ? [t.year, t.make, t.model].filter(Boolean).join(' ') : '',
+        type: t.type, status: t.status, insured: true,
+        weeks: new Map(), ytdWeeks: new Set(),
+      });
+    }
+    return groups.get(t.id);
+  };
+  for (const t of db.listTrucks(T())) groupFor(t);
+  const unassigned = { id: null, label: 'Unassigned', desc: '', type: 'tractor', status: '',
+    insured: false, weeks: new Map(), ytdWeeks: new Set() };
+  let hasUnassigned = false;
+
+  const loads = db.db.prepare(
+    `SELECT l.truck_id, l.date, l.loaded_miles, l.empty_miles, l.linehaul_cents, l.fsc_cents,
+       l.broker, l.notes,
+       d.id AS driver_id, d.pay_type, d.pay_rate, d.pay_pct
+     FROM loads l LEFT JOIN drivers d
+       ON d.id = l.driver_id AND d.tenant_id = l.tenant_id
+     WHERE l.tenant_id = ?`
+  ).all(T());
+  for (const l of loads) {
+    const g = l.truck_id != null ? groups.get(l.truck_id) : unassigned;
+    if (!g) continue; // defensive: load points at a truck row that is gone
+    if (g === unassigned) hasUnassigned = true;
+    const f = loadPayAndFees(l);
+    const ws = D.weekStartOf(l.date);
+    const w = g.weeks.get(ws) || { week_start: ws, ...blank() };
+    w.loads += 1; w.loaded_miles += l.loaded_miles || 0; w.empty_miles += l.empty_miles || 0;
+    w.gross_cents += f.gross_cents; w.pay_cents += f.pay_cents;
+    if (f.pay_unknown) w.pay_unknown_loads += 1;
+    w.factoring_cents += f.factoring_cents;
+    if (f.factoring_marker) w.factoring_marker_loads += 1; else w.factoring_default_loads += 1;
+    w.factoring_accts[f.factoring_acct] += 1;
+    w.dispatch_cents += f.dispatch_cents;
+    w.dispatch_buckets[f.dispatch_bucket].loads += 1;
+    w.dispatch_buckets[f.dispatch_bucket].gross_cents += f.gross_cents;
+    g.weeks.set(ws, w);
+    if (l.date >= ytdStart) g.ytdWeeks.add(ws);
+  }
+
+  // Recorded fuel + maintenance expenses merge into weeks that have loads.
+  const expRows = db.db.prepare(
+    `SELECT truck_id, date, category,
+       COALESCE(SUM(amount_cents),0) AS amt_cents, COUNT(*) AS n
+     FROM expenses WHERE tenant_id = ? AND truck_id IS NOT NULL
+       AND category IN ('fuel','maintenance')
+     GROUP BY truck_id, date, category`
+  ).all(T());
+  for (const r of expRows) {
+    const g = groups.get(r.truck_id);
+    if (!g) continue;
+    const w = g.weeks.get(D.weekStartOf(r.date));
+    if (!w) continue; // expense in a week with no loads for this truck
+    if (r.category === 'fuel') { w.fuel_cents += r.amt_cents; w.fuel_rows += r.n; }
+    else w.maintenance_cents += r.amt_cents;
+  }
+
+  const finishWeek = (g, w) => {
+    const total_miles = w.loaded_miles + w.empty_miles;
+    const estimated = w.fuel_rows === 0;
+    const fuel_cents = estimated ? Math.round(total_miles / 6.5 * 550) : w.fuel_cents;
+    const insurance_cents = g.insured ? INS_WEEK_CENTS : 0;
+    return {
+      week_start: w.week_start, loads: w.loads,
+      loaded_miles: w.loaded_miles, empty_miles: w.empty_miles, total_miles,
+      gross_cents: w.gross_cents, pay_cents: w.pay_cents,
+      pay_unknown_loads: w.pay_unknown_loads, net_partial: w.pay_unknown_loads > 0,
+      fuel_cents, fuel_basis: estimated ? 'estimated' : 'actual',
+      insurance_cents, maintenance_cents: w.maintenance_cents,
+      factoring_cents: w.factoring_cents,
+      factoring_marker_loads: w.factoring_marker_loads,
+      factoring_default_loads: w.factoring_default_loads,
+      factoring_accts: w.factoring_accts,
+      dispatch_cents: w.dispatch_cents, dispatch_buckets: w.dispatch_buckets,
+      net_cents: w.gross_cents - w.pay_cents - fuel_cents - insurance_cents
+        - w.maintenance_cents - w.factoring_cents - w.dispatch_cents,
+    };
+  };
+  const finish = (g) => {
+    const weeks = [...g.weeks.values()].map(w => finishWeek(g, w))
+      .sort((a, b) => (a.week_start < b.week_start ? 1 : -1));
+    const ytdWeeks = weeks.filter(w => g.ytdWeeks.has(w.week_start));
+    const sum = (k) => ytdWeeks.reduce((s, w) => s + w[k], 0);
+    const bases = new Set(ytdWeeks.map(w => w.fuel_basis));
+    const buckets = { erica: { loads: 0, gross_cents: 0 }, hybrid: { loads: 0, gross_cents: 0 }, none: { loads: 0, gross_cents: 0 } };
+    const accts = { qap: 0, nonrec: 0, none: 0 };
+    for (const w of ytdWeeks) {
+      for (const k of Object.keys(buckets)) {
+        buckets[k].loads += w.dispatch_buckets[k].loads;
+        buckets[k].gross_cents += w.dispatch_buckets[k].gross_cents;
+      }
+      for (const k of Object.keys(accts)) accts[k] += w.factoring_accts[k];
+    }
+    const ytd = {
+      year: today.slice(0, 4),
+      loads: sum('loads'), loaded_miles: sum('loaded_miles'), empty_miles: sum('empty_miles'),
+      total_miles: sum('total_miles'), gross_cents: sum('gross_cents'),
+      pay_cents: sum('pay_cents'), pay_unknown_loads: sum('pay_unknown_loads'),
+      net_partial: ytdWeeks.some(w => w.net_partial),
+      fuel_cents: sum('fuel_cents'),
+      fuel_basis: bases.size > 1 ? 'mixed' : (bases.size === 1 ? [...bases][0] : 'none'),
+      insurance_cents: sum('insurance_cents'), maintenance_cents: sum('maintenance_cents'),
+      factoring_cents: sum('factoring_cents'),
+      factoring_marker_loads: sum('factoring_marker_loads'),
+      factoring_default_loads: sum('factoring_default_loads'),
+      factoring_accts: accts,
+      dispatch_cents: sum('dispatch_cents'), dispatch_buckets: buckets,
+      net_cents: sum('net_cents'),
+    };
+    return { id: g.id, label: g.label, desc: g.desc, type: g.type, status: g.status, weeks, ytd };
+  };
+  const out = [...groups.values()].map(finish)
+    .sort((a, b) => a.label.localeCompare(b.label, 'en', { numeric: true }));
+  if (hasUnassigned) out.push(finish(unassigned));
+  return out;
+}
+
+router.get('/trucks/weekly', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  res.send(v.truckWeeklyPage(req.user, truckWeeklyRollup()));
+});
+router.get('/trucks/weekly/data', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  res.json({ ok: true, trucks: truckWeeklyRollup() });
+});
+
 router.get('/trucks', auth.canEdit, (req, res) => {
   res.send(v.trucksPage(req.user, db.listTrucks(), req.query));
 });
