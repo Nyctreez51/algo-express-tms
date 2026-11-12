@@ -151,6 +151,14 @@ function resolveDriverId(tenantId, ref) {
   const d = db.findDriverByName(String(ref).trim(), tenantId);
   return d ? d.id : null;
 }
+// Unit strings that mean a registered unit under a different spelling.
+// '2020' is Donte Murrill's AL2020 from before the AL-prefix convention —
+// every historical payload that says '2020' is a Donte/AL2020 load.
+const TRUCK_UNIT_ALIASES = { '2020': 'AL2020' };
+function normalizeUnit(ref) {
+  const up = String(ref).trim().toUpperCase();
+  return TRUCK_UNIT_ALIASES[up] || up;
+}
 function resolveTruckId(tenantId, ref) {
   if (ref == null || ref === '') return null;
   const s = String(ref).trim();
@@ -162,8 +170,26 @@ function resolveTruckId(tenantId, ref) {
     // synced with a unit string landed truck-less (blank Truck Weeks).
     // Fall through to the unit-number lookup.
   }
-  const t = db.findTruckByUnit(s, tenantId);
-  return t ? t.id : null;
+  const unit = normalizeUnit(s);
+  const t = db.findTruckByUnit(unit, tenantId) || db.findTruckByUnit(s, tenantId);
+  if (t) return t.id;
+  // No truck row carries this unit number yet (5105, 5103, AL2020, AL2021
+  // were never registered), so the load used to land truck-less and the
+  // unit never appeared on Truck Weeks at all. Register a minimal unit
+  // row on first sight so the load attaches and the unit shows up; the
+  // row can be enriched (year/make/VIN) or merged later in Trucks, and
+  // /api/v1/trucks/upsert matched by unit_number updates this same row.
+  // A failure here must never block the load itself — fall back to null.
+  try {
+    if (unit.length >= 2 && unit.length <= 32) {
+      return db.saveTruck({
+        unit_number: unit, type: 'tractor', status: 'active',
+        notes: 'Auto-registered by the sync API: this unit was named on a '
+          + 'load/expense before the truck was registered. Add year/make/VIN in Trucks.',
+      }, tenantId);
+    }
+  } catch (e) { /* fall through — load still saves, truck-less */ }
+  return null;
 }
 
 router.post('/api/v1/loads/upsert', apiAuth, express.json(), (req, res) => {
@@ -779,6 +805,7 @@ function truckWeeklyRollup() {
         desc: t.unit_number ? [t.year, t.make, t.model].filter(Boolean).join(' ') : '',
         type: t.type, status: t.status, insured: true,
         weeks: new Map(), ytdWeeks: new Set(),
+        todayLoads: 0, todayGross: 0, monthLoads: 0, monthGross: 0,
       });
     }
     return groups.get(t.id);
@@ -788,7 +815,8 @@ function truckWeeklyRollup() {
   // never silently dropped.
   for (const t of db.listTrucks(T())) if (t.status === 'active') groupFor(t);
   const unassigned = { id: null, label: 'Unassigned', desc: '', type: 'tractor', status: '',
-    insured: false, weeks: new Map(), ytdWeeks: new Set() };
+    insured: false, weeks: new Map(), ytdWeeks: new Set(),
+    todayLoads: 0, todayGross: 0, monthLoads: 0, monthGross: 0 };
   let hasUnassigned = false;
 
   const loads = db.db.prepare(
@@ -803,6 +831,12 @@ function truckWeeklyRollup() {
     const g = (l.truck_id != null && groups.get(l.truck_id)) || unassigned;
     if (g === unassigned) hasUnassigned = true;
     const f = loadPayAndFees(l);
+    // Day / calendar-month gross counters (Tree, Nov 12): the page shows
+    // what each truck did today and this month alongside week + YTD.
+    if (l.date === today) { g.todayLoads += 1; g.todayGross += f.gross_cents; }
+    if (l.date && l.date.slice(0, 7) === today.slice(0, 7)) {
+      g.monthLoads += 1; g.monthGross += f.gross_cents;
+    }
     const ws = D.weekStartOf(l.date);
     const w = g.weeks.get(ws) || { week_start: ws, ...blank() };
     w.loads += 1; w.loaded_miles += l.loaded_miles || 0; w.empty_miles += l.empty_miles || 0;
@@ -887,7 +921,21 @@ function truckWeeklyRollup() {
       dispatch_cents: sum('dispatch_cents'), dispatch_buckets: buckets,
       net_cents: sum('net_cents'),
     };
-    return { id: g.id, label: g.label, desc: g.desc, type: g.type, status: g.status, weeks, ytd };
+    // Day / week / month / YTD gross at a glance (Tree, Nov 12). The week
+    // figure reuses the finished current-week row so its net matches the
+    // table below exactly; a truck with no loads this week shows zeros.
+    const curWeekStart = D.weekStartOf(today);
+    const curWeek = weeks.find(w => w.week_start === curWeekStart);
+    const periods = {
+      today: { date: today, loads: g.todayLoads, gross_cents: g.todayGross },
+      week: { week_start: curWeekStart,
+        loads: curWeek ? curWeek.loads : 0,
+        gross_cents: curWeek ? curWeek.gross_cents : 0,
+        net_cents: curWeek ? curWeek.net_cents : 0 },
+      month: { month: today.slice(0, 7), loads: g.monthLoads, gross_cents: g.monthGross },
+      ytd: { year: ytd.year, loads: ytd.loads, gross_cents: ytd.gross_cents },
+    };
+    return { id: g.id, label: g.label, desc: g.desc, type: g.type, status: g.status, weeks, ytd, periods };
   };
   const out = [...groups.values()].map(finish)
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { numeric: true }));

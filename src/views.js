@@ -620,7 +620,15 @@ ${rows}
 <td class="num"><b>${fmtMoney(y.factoring_cents)}</b></td><td class="num"><b>${fmtMoney(y.dispatch_cents)}</b></td>
 <td class="num"><b>${fmtMoney(y.net_cents)}</b></td></tr>
 </table></div>` : '<p class="mut">No loads recorded for this unit yet.</p>';
+    const p = g.periods || { today: { date: '', loads: 0, gross_cents: 0 },
+      week: { loads: 0, gross_cents: 0, net_cents: 0 }, month: { month: '', loads: 0, gross_cents: 0 } };
+    const ld = (n) => `${n} load${n === 1 ? '' : 's'}`;
     return `<h2>Truck ${esc(g.label)}${g.desc ? ` <span class="mut" style="font-size:13px;font-weight:400">${esc(g.desc)}</span>` : ''}</h2>
+<div class="grid" style="grid-template-columns:1fr 1fr 1fr;margin-bottom:12px">
+${statCard('Today', fmtMoney(p.today.gross_cents), `${ld(p.today.loads)} · ${fmtDate(p.today.date)}`)}
+${statCard('This week (Fri–Thu)', fmtMoney(p.week.gross_cents), `${ld(p.week.loads)} · net ${fmtMoney(p.week.net_cents)}`)}
+${statCard(monthLabel(p.month.month), fmtMoney(p.month.gross_cents), ld(p.month.loads))}
+</div>
 <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:12px">
 ${statCard(`${y.year} gross`, fmtMoney(y.gross_cents), `${y.loads} loads · ${fmtNum(y.total_miles)} mi (${fmtNum(y.loaded_miles)} loaded · ${fmtNum(y.empty_miles)} empty) YTD`)}
 ${statCard(`${y.year} net for ALGO`, fmtMoney(y.net_cents), 'after pay, fuel, insurance, maintenance, factoring, dispatch')}
@@ -638,7 +646,7 @@ ${table}`;
   return layout({
     title: 'Truck weeks', user, active: '/trucks/weekly',
     body: `<h1>Trucks — weekly mileage, gross &amp; net</h1>
-<p class="mut" style="margin-bottom:6px">Each truck's mileage and gross by settlement week (<b>Friday → Thursday</b>), by pickup date. Gross = linehaul + fuel surcharge. <b>Net</b> = gross − driver pay − fuel − insurance − maintenance − factoring − dispatch. Driver pay: per-mile rate × loaded miles, or pay % × linehaul. Fuel: recorded fuel expenses where the truck has them, otherwise estimated at total miles ÷ 6.5 mpg × $5.50/gal (marked <i>estimated</i>). Insurance: $3,000/month per-truck allocation ($692.31/week). Maintenance: recorded expenses only. Factoring: TQL → QAP 2.0% of gross, other brokers → NONRECOURSE 2.7%, unless the load record names an account. Dispatch: Erica 7% · Hybrid 3% · self-booked/RXO 0%, per the dispatcher the load record names. Year-to-date totals are the current calendar year, pickup-date basis.</p>
+<p class="mut" style="margin-bottom:6px">Each truck shows gross for <b>today</b>, <b>this week</b>, <b>this month</b> and <b>year to date</b> up top, then the week-by-week detail. Weeks are settlement weeks (<b>Friday → Thursday</b>), by pickup date. Gross = linehaul + fuel surcharge. <b>Net</b> = gross − driver pay − fuel − insurance − maintenance − factoring − dispatch. Driver pay: per-mile rate × loaded miles, or pay % × linehaul. Fuel: recorded fuel expenses where the truck has them, otherwise estimated at total miles ÷ 6.5 mpg × $5.50/gal (marked <i>estimated</i>). Insurance: $3,000/month per-truck allocation ($692.31/week). Maintenance: recorded expenses only. Factoring: TQL → QAP 2.0% of gross, other brokers → NONRECOURSE 2.7%, unless the load record names an account. Dispatch: Erica 7% · Hybrid 3% · self-booked/RXO 0%, per the dispatcher the load record names. Year-to-date totals are the current calendar year, pickup-date basis.</p>
 ${sections || '<p class="mut">No trucks yet.</p>'}`,
   });
 }
