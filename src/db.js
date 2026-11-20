@@ -589,6 +589,13 @@ function saveDriver(d, tenantId = TENANT) {
   return r.lastInsertRowid;
 }
 
+function deleteDriver(id, tenantId = TENANT) {
+  // History is preserved by the schema: loads.driver_id goes NULL (FK SET
+  // NULL) while escrow entries, trips and safety scores cascade-delete with
+  // the driver, and user accounts keep their row with driver_id NULL.
+  db.prepare('DELETE FROM drivers WHERE id = ? AND tenant_id = ?').run(id, tenantId);
+}
+
 // ---- Driver safety scores (Motive) ----
 function latestSafetyScore(driverId, tenantId = TENANT) {
   return db.prepare(`SELECT * FROM safety_scores
@@ -1002,7 +1009,7 @@ module.exports = {
   newSessionToken, createSession, getSession, deleteSession,
   getCompany,
   listTrucks, getTruck, saveTruck, findTruckByUnit, deleteTruck,
-  listDrivers, getDriver, findDriverByName, saveDriver,
+  listDrivers, getDriver, findDriverByName, saveDriver, deleteDriver,
   listBrokers, findBroker, upsertBroker, recordBrokerContact, brokerBook,
   safetyGrade, latestSafetyScore, saveSafetyScore,
   listLoads, getLoad, saveLoad, upsertLoad, deleteLoad,

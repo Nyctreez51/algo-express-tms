@@ -437,7 +437,8 @@ function driversPage(user, drivers, q) {
 <td>${safetyCell}</td>
 <td class="num">${d.escrow_balance ? fmtMoney(d.escrow_balance) : '—'}</td>
 <td><a class="btn small ghost" href="/drivers/${d.id}/escrow">Escrow</a>
-<a class="btn small ghost" href="/drivers/${d.id}/edit">Edit</a></td></tr>`;
+<a class="btn small ghost" href="/drivers/${d.id}/edit">Edit</a>
+${user && user.role !== 'driver' ? `<form method="post" action="/drivers/${d.id}/delete" style="display:inline" onsubmit="return confirm('Remove this driver permanently? Their loads stay in history without a driver attached.')"><button class="btn small danger">Remove</button></form>` : ''}</td></tr>`;
   }).join('');
   return layout({
     title: 'Drivers', user, active: '/drivers',

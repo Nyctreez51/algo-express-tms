@@ -290,6 +290,14 @@ router.post('/api/v1/drivers/upsert', apiAuth, express.json(), (req, res) => {
   }, req.tenantId);
   res.json({ ok: true, id, updated: !!ex, driver: db.getDriver(id, req.tenantId) });
 });
+router.post('/api/v1/drivers/delete', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  const d = b.id ? db.getDriver(Number(b.id), req.tenantId)
+    : (b.name ? db.findDriverByName(String(b.name).trim(), req.tenantId) : null);
+  if (!d) return res.status(404).json({ ok: false, error: 'driver not found' });
+  db.deleteDriver(d.id, req.tenantId);
+  res.json({ ok: true, deleted: d.id, name: d.name });
+});
 
 router.get('/api/v1/trucks', apiAuth, (req, res) => {
   res.json({ ok: true, trucks: db.listTrucks(req.tenantId) });
@@ -690,6 +698,12 @@ router.post('/drivers/:id/edit', auth.canEdit, express.urlencoded({ extended: fa
     pay_pct: toNum(b.pay_pct, 30), pay_type: b.pay_type, pay_rate: toNum(b.pay_rate, null),
     status: b.status, notes: b.notes });
   res.redirect('/drivers?ok=Driver+updated.');
+});
+router.post('/drivers/:id/delete', auth.canEdit, (req, res) => {
+  const d = db.getDriver(req.params.id);
+  if (!d) return res.status(404).send('Not found');
+  db.deleteDriver(d.id);
+  res.redirect('/drivers?ok=Driver+removed.');
 });
 
 // ----- driver escrow ledger -----
