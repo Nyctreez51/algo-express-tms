@@ -224,6 +224,66 @@ CREATE INDEX IF NOT EXISTS idx_loads_tenant_date ON loads(tenant_id, date);
 CREATE INDEX IF NOT EXISTS idx_loads_driver ON loads(tenant_id, driver_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_tenant_date ON expenses(tenant_id, date);
 CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
+
+-- Driver pay profiles (Settlements pay-basis fix, Nov 22 2026): the ONE
+-- source of truth for how a driver is paid. Effective-dated so a rate
+-- change never rewrites history — the pay engine (src/pay.js) picks, per
+-- load, the profile in effect on that load's DELIVERY date. pay_type is
+-- 'percent_gross' | 'percent_linehaul' | 'per_mile'. New drivers are
+-- seeded at 25–30% (percent_gross or percent_linehaul) tiered by
+-- experience (Tree, Nov 22 2026). drivers.pay_pct/pay_type/pay_rate stay
+-- as a denormalized cache of the CURRENT profile for older screens.
+CREATE TABLE IF NOT EXISTS driver_pay_profiles (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id     TEXT NOT NULL,
+  driver_id     INTEGER NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+  pay_type      TEXT NOT NULL CHECK (pay_type IN ('percent_gross','percent_linehaul','per_mile')),
+  pay_pct       REAL,              -- percent drivers: 35, 25, 30, 86 ...
+  pay_rate      REAL,              -- per-mile drivers: dollars per loaded mile
+  fsc_rate      REAL NOT NULL DEFAULT 0.50,  -- fallback FSC $/loaded mi for the LH split
+  effective_from TEXT NOT NULL,    -- YYYY-MM-DD, first delivery date this profile governs
+  effective_to   TEXT,             -- NULL = current
+  notes         TEXT,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_pay_profiles_driver
+  ON driver_pay_profiles(tenant_id, driver_id, effective_from);
+
+-- Settlements (Nov 22 2026): a finalized settlement is FROZEN — its lines
+-- and totals never recompute. Corrections land as adjustments in a later
+-- week (settlement_adjustments). loads.settlement_id is the double-pay
+-- lock: a stamped load is never picked up by another settlement run.
+CREATE TABLE IF NOT EXISTS settlements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL, driver_id INTEGER NOT NULL REFERENCES drivers(id),
+  week_start TEXT NOT NULL,              -- Friday of the pay week
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','finalized')),
+  gross_cents INTEGER NOT NULL DEFAULT 0, pay_cents INTEGER NOT NULL DEFAULT 0,
+  escrow_cents INTEGER NOT NULL DEFAULT 0, adjustments_cents INTEGER NOT NULL DEFAULT 0,
+  net_cents INTEGER NOT NULL DEFAULT 0,
+  finalized_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (tenant_id, driver_id, week_start)
+);
+CREATE TABLE IF NOT EXISTS settlement_lines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  settlement_id INTEGER NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  load_id INTEGER NOT NULL REFERENCES loads(id),
+  pay_type TEXT NOT NULL,                -- basis actually applied, copied from the profile
+  loaded_miles REAL NOT NULL DEFAULT 0,
+  gross_cents INTEGER NOT NULL, linehaul_cents INTEGER NOT NULL, fsc_cents INTEGER NOT NULL,
+  pay_cents INTEGER NOT NULL,
+  rolled_in INTEGER NOT NULL DEFAULT 0   -- 1 = delivered before this week, paid now
+);
+CREATE TABLE IF NOT EXISTS settlement_adjustments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL, driver_id INTEGER NOT NULL REFERENCES drivers(id),
+  week_start TEXT NOT NULL,              -- settlement week the adjustment lands in
+  kind TEXT NOT NULL CHECK (kind IN ('advance','deduction','reimbursement','carryover')),
+  amount_cents INTEGER NOT NULL,         -- signed: deductions/advances negative, reimbursements positive
+  notes TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_settle_adj_driver
+  ON settlement_adjustments(tenant_id, driver_id, week_start);
 `;
 
 db.exec(SCHEMA);
@@ -307,6 +367,14 @@ function migrate() {
   if (!lcols.includes('broker_contact_name')) db.exec(`ALTER TABLE loads ADD COLUMN broker_contact_name TEXT`);
   if (!lcols.includes('broker_contact_email')) db.exec(`ALTER TABLE loads ADD COLUMN broker_contact_email TEXT`);
   if (!lcols.includes('broker_contact_phone')) db.exec(`ALTER TABLE loads ADD COLUMN broker_contact_phone TEXT`);
+  // Settlement fields on loads (pay-basis fix, Nov 22 2026): delivery_date
+  // is the pay-week membership key (Fri–Thu by DELIVERY date, Tree Nov 20);
+  // pay_override_cents is a flat-fee pay (e.g. a $150 TONU) that wins over
+  // every computed basis; settlement_id is the double-pay lock, stamped
+  // when a load is included in a FINALIZED settlement.
+  if (!lcols.includes('delivery_date')) db.exec(`ALTER TABLE loads ADD COLUMN delivery_date TEXT`);
+  if (!lcols.includes('pay_override_cents')) db.exec(`ALTER TABLE loads ADD COLUMN pay_override_cents INTEGER`);
+  if (!lcols.includes('settlement_id')) db.exec(`ALTER TABLE loads ADD COLUMN settlement_id INTEGER`);
   const scols = db.prepare(`PRAGMA table_info(sessions)`).all().map(c => c.name);
   // NOTE: plain nullable column on purpose — SQLite's ALTER TABLE rejects
   // expression defaults like (datetime('now')) on some builds, which crashed
@@ -366,6 +434,85 @@ function migrate() {
       if (drv) insS.run(TENANT, drv.id, '2026-09-21', '2026-10-18', score, safetyGrade(score), focus, miles, ev, spd, 'Motive');
     }
     db.prepare(`INSERT INTO meta (k,v) VALUES ('safety-scores-2026-10-25','1')`).run();
+  }
+  // Pay profiles (Nov 22 2026): seed the recorded deals for any driver who
+  // has none yet. Idempotent — a driver with profiles is never re-seeded,
+  // so owner edits in the data are safe.
+  seedPayProfiles(TENANT);
+}
+
+// Keep the drivers-row pay fields as a cache of the driver's CURRENT
+// profile (the newest effective_from with no effective_to, else the
+// latest). Older screens read the cache; the pay engine reads profiles.
+function syncDriverPayCache(driverId, tenantId = TENANT) {
+  const p = db.prepare(`SELECT * FROM driver_pay_profiles
+    WHERE tenant_id = ? AND driver_id = ?
+    ORDER BY (effective_to IS NULL) DESC, effective_from DESC, id DESC LIMIT 1`)
+    .get(tenantId, driverId);
+  if (!p) return;
+  if (p.pay_type === 'per_mile') {
+    db.prepare(`UPDATE drivers SET pay_type='per_mile', pay_rate=?, pay_pct=COALESCE(pay_pct, pay_pct)
+      WHERE id=? AND tenant_id=?`).run(p.pay_rate, driverId, tenantId);
+  } else {
+    db.prepare(`UPDATE drivers SET pay_type='percent', pay_pct=?, pay_rate=NULL
+      WHERE id=? AND tenant_id=?`).run(p.pay_pct, driverId, tenantId);
+  }
+}
+
+// Seed pay profiles from the deals on record (Nov 22 2026). Dates are
+// settlement-effective per Tree's directions; see the roadmap spec
+// (settlements-pay-basis-fix-spec-2026-11-22.md §3.1) plus Tree's Nov 22
+// updates: ALL drivers move to percentage going forward (new drivers
+// 25–30% percent_gross/percent_linehaul by experience); per-mile survives
+// only for Hammond (until his truck switch, date TBD — no future profile
+// created yet) and, historically, for Donte Murrill, whose departure
+// moved up to before Nov 29 2026 — his profile ends 2026-11-28.
+// NOTE on Parker/Thompson: the gross basis starts 2026-11-12, not 11-13,
+// because the Nov 20 settlement paid the two loads DELIVERED Nov 12
+// (Trident 1172674, Quantam 10639) at 35% of gross — the golden test
+// (§5.2 of the spec) requires the profile in effect on those delivery
+// dates to be the gross basis.
+function seedPayProfiles(tenantId = TENANT) {
+  const seeds = [
+    // name, [pay_type, pay_pct, pay_rate, effective_from, effective_to, notes]
+    ['Michael Parker', [
+      ['percent_linehaul', 35, null, '2026-01-01', '2026-11-11', 'Original terms: 35% of linehaul after the FSC carve-out'],
+      ['percent_gross', 35, null, '2026-11-12', null, "Tree, Nov 19 2026: 'we struck a deal' — 35% of GROSS flat, no carve-out, effective the Nov 20, 2026 settlement (covers the Nov 12 roll-in loads paid in that settlement)"],
+    ]],
+    ['Jerimiah Thompson', [
+      ['percent_linehaul', 35, null, '2026-01-01', '2026-11-11', 'Original terms: 35% of linehaul after the FSC carve-out'],
+      ['percent_gross', 35, null, '2026-11-12', null, "Tree, Nov 19 2026: 'we struck a deal' — 35% of GROSS flat, no carve-out, effective the Nov 20, 2026 settlement (covers the Nov 12 roll-in load paid in that settlement)"],
+    ]],
+    ['Robert Davis Jr', [
+      ['percent_linehaul', 30, null, '2026-11-01', '2026-11-20', 'Hire terms: 30% of linehaul after the 50c FSC carve-out'],
+      ['percent_linehaul', 25, null, '2026-11-21', null, 'Tree, Nov 21 2026: rate cut to 25% of linehaul (experience tier). The paid Nov 20 week is NOT recomputed — the $293.00 difference is recovered via scheduled settlement deductions ($97.67 / $97.67 / $97.66 on the Nov 27, Dec 4, Dec 11 settlements)'],
+    ]],
+    ['Donte Murrill', [
+      ['per_mile', null, 0.65, '2026-01-01', '2026-11-28', 'Solo $0.65/loaded mi. Departure moved up (Tree, Nov 22 2026): leaving before Nov 29, 2026 — profile ends Nov 28. Percentage terms to be set by Tree if he returns.'],
+    ]],
+    ['Shdermon Hammond', [
+      ['per_mile', null, 0.65, '2026-01-01', null, '$0.65/loaded mi — the ONLY per-mile deal that survives (Tree, Nov 22 2026), and only until his truck switch (date TBD); his percentage profile (25% or 30%) is created when Tree picks it.'],
+    ]],
+    ['Tyler Carter', [
+      ['per_mile', null, 0.60, '2026-01-01', null, 'Solo $0.60/loaded mi (inactive — leave of absence since Nov 13, 2026). Percentage terms to be set by Tree if he returns, per the Nov 22 all-percentage policy.'],
+    ]],
+    ['Anthony Abbott', [
+      ['percent_gross', 86, null, '2026-01-01', null, 'Owner-operator agreement: 86% of gross (Amazon Relay only)'],
+    ]],
+  ];
+  const ins = db.prepare(`INSERT INTO driver_pay_profiles
+    (tenant_id, driver_id, pay_type, pay_pct, pay_rate, fsc_rate, effective_from, effective_to, notes)
+    VALUES (?,?,?,?,?,0.50,?,?,?)`);
+  const count = db.prepare(`SELECT COUNT(*) AS n FROM driver_pay_profiles
+    WHERE tenant_id = ? AND driver_id = ?`);
+  for (const [name, profiles] of seeds) {
+    const drv = findDriverByName(name, tenantId);
+    if (!drv) continue;                       // driver not in this database
+    if (count.get(tenantId, drv.id).n > 0) continue;  // already seeded/edited
+    for (const [payType, pct, rate, from, to, notes] of profiles) {
+      ins.run(tenantId, drv.id, payType, pct, rate, from, to, notes);
+    }
+    syncDriverPayCache(drv.id, tenantId);
   }
 }
 migrate();
@@ -631,39 +778,55 @@ function saveLoad(l, tenantId = TENANT) {
   // Broker contact fields: callers that don't know about them (web forms)
   // leave them undefined on updates — preserve what's already stored then,
   // so editing a load in the UI never wipes contact info the API recorded.
+  // Same preserve-on-undefined rule for the settlement fields
+  // (delivery_date / pay_override_cents / settlement_id): a caller that
+  // doesn't pass them must never clear a delivery date or unlock a paid
+  // load by accident. Pass an explicit null to clear one.
   let bcName = l.broker_contact_name, bcEmail = l.broker_contact_email, bcPhone = l.broker_contact_phone;
-  if (l.id && (bcName === undefined || bcEmail === undefined || bcPhone === undefined)) {
-    const ex = db.prepare('SELECT broker_contact_name, broker_contact_email, broker_contact_phone FROM loads WHERE id = ? AND tenant_id = ?')
+  let deliveryDate = l.delivery_date, payOverride = l.pay_override_cents, settlementId = l.settlement_id;
+  if (l.id && (bcName === undefined || bcEmail === undefined || bcPhone === undefined
+    || deliveryDate === undefined || payOverride === undefined || settlementId === undefined)) {
+    const ex = db.prepare(`SELECT broker_contact_name, broker_contact_email, broker_contact_phone,
+        delivery_date, pay_override_cents, settlement_id FROM loads WHERE id = ? AND tenant_id = ?`)
       .get(l.id, tenantId);
     if (ex) {
       if (bcName === undefined) bcName = ex.broker_contact_name;
       if (bcEmail === undefined) bcEmail = ex.broker_contact_email;
       if (bcPhone === undefined) bcPhone = ex.broker_contact_phone;
+      if (deliveryDate === undefined) deliveryDate = ex.delivery_date;
+      if (payOverride === undefined) payOverride = ex.pay_override_cents;
+      if (settlementId === undefined) settlementId = ex.settlement_id;
     }
   }
   let id;
   if (l.id) {
     db.prepare(`UPDATE loads SET date=?, origin=?, destination=?, loaded_miles=?, empty_miles=?,
       linehaul_cents=?, fsc_cents=?, broker=?, broker_contact_name=?, broker_contact_email=?,
-      broker_contact_phone=?, driver_id=?, truck_id=?, status=?, notes=?
+      broker_contact_phone=?, driver_id=?, truck_id=?, status=?, notes=?,
+      delivery_date=?, pay_override_cents=?, settlement_id=?
       WHERE id=? AND tenant_id=?`)
       .run(l.date, l.origin || null, l.destination || null, l.loaded_miles || 0,
         l.empty_miles || 0, l.linehaul_cents || 0, l.fsc_cents || 0, l.broker || null,
         bcName || null, bcEmail || null, bcPhone || null,
         l.driver_id || null, l.truck_id || null, l.status || 'delivered', l.notes || null,
+        deliveryDate || null, payOverride != null ? payOverride : null,
+        settlementId != null ? settlementId : null,
         l.id, tenantId);
     id = l.id;
   } else {
     const r = db.prepare(`INSERT INTO loads
       (tenant_id, external_id, date, origin, destination, loaded_miles, empty_miles,
        linehaul_cents, fsc_cents, broker, broker_contact_name, broker_contact_email,
-       broker_contact_phone, driver_id, truck_id, status, notes)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+       broker_contact_phone, driver_id, truck_id, status, notes,
+       delivery_date, pay_override_cents, settlement_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(tenantId, l.external_id || null, l.date, l.origin || null, l.destination || null,
         l.loaded_miles || 0, l.empty_miles || 0, l.linehaul_cents || 0, l.fsc_cents || 0,
         l.broker || null, bcName || null, bcEmail || null, bcPhone || null,
         l.driver_id || null, l.truck_id || null,
-        l.status || 'delivered', l.notes || null);
+        l.status || 'delivered', l.notes || null,
+        deliveryDate || null, payOverride != null ? payOverride : null,
+        settlementId != null ? settlementId : null);
     id = r.lastInsertRowid;
   }
   // Book of Brokers auto-update: a load saved with an individual contact
@@ -1015,6 +1178,7 @@ module.exports = {
   listLoads, getLoad, saveLoad, upsertLoad, deleteLoad,
   listExpenses, getExpense, saveExpense, upsertExpense, deleteExpense,
   createEscrowEntry, listEscrowEntries, escrowBalance, escrowWithheld,
+  seedPayProfiles, syncDriverPayCache,
   listDocumentsByLoad, getDocument, createDocument, deleteDocument,
   createApiKey, findTenantByApiKey, listApiKeys, deleteApiKey,
   activeTrip, startTrip, endTrip, addPosition, attachTripLoad, tripMiles, fleetSnapshot,

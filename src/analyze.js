@@ -1,11 +1,14 @@
-// analyze.js — load analyzer: lane distance, FSC split (Tree's 65c rule),
-// fuel plan, driver pay from the driver's own terms, fixed-cost allocation,
-// round-trip/backhaul view, lane history, and HOS feasibility.
+// analyze.js — load analyzer: lane distance, FSC split (Tree's 50c rule,
+// Nov 13 2026 — was 65c), fuel plan, driver pay from the driver's own pay
+// profile (src/pay.js — the same basis the settlements engine uses),
+// fixed-cost allocation, round-trip/backhaul view, lane history, and HOS
+// feasibility.
 // Distances: real road miles via the public OSRM demo router when reachable;
 // otherwise a straight-line x1.22 circuity estimate, labeled as such.
 'use strict';
 
 const { geocodeCity } = require('./geocode');
+const pay = require('./pay');
 
 // "Rincon, GA" / "Rincon GA" / "Rincon, Georgia" -> { city, state, lat, lon } or null
 const STATE_NAMES = {
@@ -80,20 +83,31 @@ async function roadRoute(a, b) {
   return { miles, hours: Math.round((miles / 47) * 10) / 10, source: 'estimate' };
 }
 
-// Split a gross rate by Tree's rule: FSC = $0.65 x loaded miles carved out.
+// Split a gross rate by Tree's rule: FSC = $0.50 x loaded miles carved
+// out (rate cut from $0.65 on Nov 13, 2026).
 function fscSplit(gross, loadedMiles) {
-  const fsc = Math.max(0, Math.min(0.65 * loadedMiles, gross));
+  const fsc = Math.max(0, Math.min(0.50 * loadedMiles, gross));
   return { fsc: round2(fsc), linehaul: round2(gross - fsc) };
 }
 
-function driverPay(driver, linehaul, truckMiles) {
+// Planning estimate of driver pay on the driver's own basis — the same
+// profile the settlements engine pays on (src/pay.js). Per-mile stays a
+// planning figure on TRUCK miles here (deadhead included) because this
+// page prices a load before it is booked; settlements pay loaded only.
+function driverPay(driver, split, truckMiles) {
   if (!driver) return null;
-  if (driver.pay_type === 'per_mile') {
-    const rate = Number(driver.pay_rate) || 0;
+  const profile = driver.id ? pay.profileFor(driver.id, null) : null;
+  const type = profile ? profile.pay_type
+    : (driver.pay_type === 'per_mile' ? 'per_mile' : 'percent_linehaul');
+  if (type === 'per_mile') {
+    const rate = profile ? Number(profile.pay_rate) || 0 : Number(driver.pay_rate) || 0;
     return { amount: round2(rate * truckMiles), basis: `$${rate.toFixed(2)}/mi x ${Math.round(truckMiles)} truck mi` };
   }
-  const pct = Number(driver.pay_pct) || 0;
-  return { amount: round2(linehaul * pct / 100), basis: `${pct}% of linehaul` };
+  const pct = profile ? Number(profile.pay_pct) || 0 : Number(driver.pay_pct) || 0;
+  if (type === 'percent_gross') {
+    return { amount: round2((split.linehaul + split.fsc) * pct / 100), basis: `${pct}% of gross` };
+  }
+  return { amount: round2(split.linehaul * pct / 100), basis: `${pct}% of linehaul` };
 }
 
 const round2 = (x) => Math.round(x * 100) / 100;
@@ -136,7 +150,7 @@ async function analyze(input, ctx) {
   const fuelCost = gallons * fuelPrice;
 
   // Driver pay + fixed cost per day.
-  const pay = driverPay(ctx.driver, split.linehaul, truckMiles);
+  const pay = driverPay(ctx.driver, split, truckMiles);
   const driveHours = deadheadHours + lane.hours;
   let days = Math.max(1, Math.ceil(driveHours / 10));
   let windowHours = null;
@@ -161,7 +175,7 @@ async function analyze(input, ctx) {
   let rt = null;
   if (backhaulRate > 0) {
     const bSplit = fscSplit(backhaulRate, loadedMiles);
-    const bPay = driverPay(ctx.driver, bSplit.linehaul, loadedMiles);
+    const bPay = driverPay(ctx.driver, bSplit, loadedMiles);
     const rtRevenue = rate + backhaulRate;
     const rtFuel = (rtMiles / mpg) * fuelPrice;
     const rtDays = Math.max(days, Math.ceil((driveHours * 2) / 10));

@@ -12,6 +12,7 @@ const db = require('./db');
 const auth = require('./auth');
 const AZ = require('./analyze');
 const perf = require('./performance');
+const pay = require('./pay');
 const RC = require('./ratecon');
 const v = require('./views');
 const D = require('./dates');
@@ -215,6 +216,10 @@ router.post('/api/v1/loads/upsert', apiAuth, express.json(), (req, res) => {
     truck_id: resolveTruckId(req.tenantId, b.truck ?? b.truck_id),
     status: b.status || 'delivered',
     notes: b.notes || null,
+    // Settlement fields (Nov 22 2026): undefined = preserve what's stored.
+    delivery_date: b.delivery_date !== undefined ? (b.delivery_date || null) : undefined,
+    pay_override_cents: b.pay_override !== undefined && b.pay_override !== null
+      ? toCents(b.pay_override) : undefined,
   }, req.tenantId);
   res.json({ ok: true, id: r.id, updated: r.updated });
 });
@@ -403,7 +408,19 @@ function dashboardData(monthYm) {
       ON l.driver_id = d.id AND l.tenant_id = d.tenant_id AND l.date >= ?
     WHERE d.tenant_id = ? GROUP BY d.id ORDER BY gross DESC`
   ).all(y0, T());
-  drivers.forEach(x => { x.pay = Math.round(x.gross * (x.pay_pct || 0) / 100); });
+  // Pay from the one engine (src/pay.js), per load, on each driver's own
+  // basis — the old shortcut paid every percent driver on gross.
+  const payLoads = db.db.prepare(
+    `SELECT driver_id, date, delivery_date, loaded_miles, linehaul_cents, fsc_cents, pay_override_cents
+     FROM loads WHERE tenant_id = ? AND driver_id IS NOT NULL AND date >= ?`
+  ).all(T(), y0);
+  const payByDriver = new Map();
+  for (const l of payLoads) {
+    const profile = pay.profileFor(l.driver_id, l.delivery_date || l.date, T());
+    const res = pay.payForLoad(profile, l);
+    if (!res.exception) payByDriver.set(l.driver_id, (payByDriver.get(l.driver_id) || 0) + res.pay_cents);
+  }
+  drivers.forEach(x => { x.pay = payByDriver.get(x.id) || 0; });
 
   const expCats = db.db.prepare(
     `SELECT category, SUM(amount_cents) AS total FROM expenses
@@ -451,6 +468,8 @@ router.post('/loads/new', auth.canEdit, express.urlencoded({ extended: false }),
     broker: b.broker, external_id: b.external_id,
     driver_id: b.driver_id || null, truck_id: b.truck_id || null,
     status: b.status, notes: b.notes,
+    delivery_date: b.delivery_date || null,
+    pay_override_cents: b.pay_override === '' || b.pay_override == null ? null : toCents(b.pay_override),
   });
   res.redirect('/loads?ok=Load+saved.');
 });
@@ -468,6 +487,8 @@ router.post('/loads/:id/edit', auth.canEdit, express.urlencoded({ extended: fals
     linehaul_cents: toCents(b.linehaul), fsc_cents: toCents(b.fsc),
     broker: b.broker, driver_id: b.driver_id || null, truck_id: b.truck_id || null,
     status: b.status, notes: b.notes,
+    delivery_date: b.delivery_date || null,
+    pay_override_cents: b.pay_override === '' || b.pay_override == null ? null : toCents(b.pay_override),
   });
   res.redirect('/loads?ok=Load+updated.');
 });
@@ -586,41 +607,23 @@ router.post('/expenses/:id/delete', auth.canEdit, (req, res) => {
   res.redirect('/expenses?ok=Expense+deleted.');
 });
 
-// ----- settlements (Fri–Thu weeks) -----
+// ----- settlements (Fri–Thu weeks, by DELIVERY date) -----
+// All pay math lives in src/pay.js (the one pay engine). This page reads
+// buildSettlement() per active driver: drafts compute live from payable
+// loads; finalized weeks read back frozen. YTD = finalized settlements.
 function settlementWeek(weekStart) {
-  const [w0, w1] = D.weekRange(weekStart);
-  const y0 = D.yearStart(w1);
-  const rows = db.db.prepare(
-    `SELECT d.id, d.name, d.pay_pct, d.pay_type, d.pay_rate,
-      COUNT(l.id) AS loads,
-      COALESCE(SUM(l.loaded_miles + l.empty_miles),0) AS miles,
-      COALESCE(SUM(l.loaded_miles),0) AS loaded_miles,
-      COALESCE(SUM(l.linehaul_cents + l.fsc_cents),0) AS gross,
-      COALESCE((SELECT SUM(l2.linehaul_cents + l2.fsc_cents) FROM loads l2
-        WHERE l2.tenant_id = d.tenant_id AND l2.driver_id = d.id AND l2.date >= ?),0) AS ytd_gross,
-      COALESCE((SELECT SUM(l2.loaded_miles) FROM loads l2
-        WHERE l2.tenant_id = d.tenant_id AND l2.driver_id = d.id AND l2.date >= ?),0) AS ytd_loaded_miles,
-      COALESCE((SELECT COUNT(*) FROM loads l3
-        WHERE l3.tenant_id = d.tenant_id AND l3.driver_id = d.id AND l3.date >= ?),0) AS ytd_loads
-    FROM drivers d LEFT JOIN loads l
-      ON l.driver_id = d.id AND l.tenant_id = d.tenant_id AND l.date >= ? AND l.date <= ?
-    WHERE d.tenant_id = ? AND d.status = 'active'
-    GROUP BY d.id ORDER BY d.name`
-  ).all(y0, y0, y0, w0, w1, T());
-  rows.forEach(r => {
-    if (r.pay_type === 'per_mile' && Number(r.pay_rate) > 0) {
-      r.pay = Math.round(r.loaded_miles * r.pay_rate * 100);       // cents
-      r.ytd_pay = Math.round(r.ytd_loaded_miles * r.pay_rate * 100);
-      r.pay_basis = `$${Number(r.pay_rate).toFixed(2)}/mi × ${fmtNum(r.loaded_miles)} mi`;
-    } else {
-      r.pay = Math.round(r.gross * (r.pay_pct || 0) / 100);
-      r.ytd_pay = Math.round(r.ytd_gross * (r.pay_pct || 0) / 100);
-      r.pay_basis = `${r.pay_pct || 0}% of gross`;
-    }
-    r.escrow_withheld = db.escrowWithheld(r.id, w0, w1, T());
-    r.escrow_balance = db.escrowBalance(r.id, T());
-  });
-  return rows;
+  return db.listDrivers(T()).filter(d => d.status === 'active').map(d => {
+    const s = pay.buildSettlement(d.id, weekStart, T());
+    return {
+      id: d.id, name: d.name,
+      loads: s.loads, miles: s.miles, loaded_miles: s.loaded_miles,
+      gross: s.gross_cents, pay: s.pay_cents, pay_basis: s.pay_basis,
+      ytd_pay: s.ytd_pay_cents, ytd_loads: s.ytd_loads,
+      escrow_withheld: s.escrow_cents, escrow_balance: s.escrow_balance_cents,
+      adjustments: s.adjustments_cents, net: s.net_cents,
+      status: s.status, exceptions: s.exceptions,
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function recentWeekStarts(n = 26) {
@@ -634,6 +637,48 @@ router.get('/settlements', auth.requireRoles('owner', 'editor', 'viewer'), (req,
   let week = req.query.week || D.weekStartOf(D.todayStr());
   if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) week = D.weekStartOf(D.todayStr());
   res.send(v.settlementsPage(req.user, week, recentWeekStarts(), settlementWeek(week), req.query));
+});
+
+// Freeze one driver's week (or every active driver's, when no driver_id
+// is posted). A finalized settlement never recomputes — its loads are
+// stamped so they can never be paid twice.
+router.post('/settlements/finalize', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const week = /^\d{4}-\d{2}-\d{2}$/.test(req.body.week || '') ? req.body.week : D.weekStartOf(D.todayStr());
+  const one = req.body.driver_id ? Number(req.body.driver_id) : null;
+  const drivers = db.listDrivers(T()).filter(d => d.status === 'active' && (!one || d.id === one));
+  const done = [], skipped = [];
+  for (const d of drivers) {
+    const r = pay.finalizeSettlement(d.id, week, T());
+    if (r.error) skipped.push(`${d.name}: ${r.error}`);
+    else if (!r.already) done.push(d.name);
+  }
+  const q = new URLSearchParams({ week });
+  if (done.length) q.set('ok', `Finalized: ${done.join(', ')}.`);
+  if (skipped.length) q.set('err', skipped.join(' '));
+  res.redirect('/settlements?' + q.toString());
+});
+
+// Record an advance / deduction / reimbursement / carryover against a
+// driver's settlement week. Signed dollars: enter deductions and advances
+// as negative amounts. A finalized week is frozen — corrections must land
+// in a later week (that is exactly how Robert's $293 true-up is handled).
+router.post('/settlements/adjustments', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  const week = /^\d{4}-\d{2}-\d{2}$/.test(b.week || '') ? b.week : D.weekStartOf(D.todayStr());
+  const driverId = Number(b.driver_id);
+  const kind = ['advance', 'deduction', 'reimbursement', 'carryover'].includes(b.kind) ? b.kind : null;
+  const cents = Math.round(Number(b.amount) * 100);
+  const back = '/settlements?week=' + week;
+  if (!driverId || !db.getDriver(driverId, T())) return res.redirect(back + '&err=Pick+a+driver.');
+  if (!kind) return res.redirect(back + '&err=Pick+an+adjustment+type.');
+  if (!Number.isFinite(cents) || cents === 0) return res.redirect(back + '&err=Enter+a+non-zero+amount+(negative+for+deductions).');
+  const fin = pay.getSettlement(driverId, week, T());
+  if (fin && fin.status === 'finalized') {
+    return res.redirect(back + '&err=' + encodeURIComponent('That week is finalized and frozen — put the correction in a later week.'));
+  }
+  pay.createAdjustment({ driverId, weekStart: week, kind, amountCents: cents,
+    notes: (b.notes || '').trim() || null }, T());
+  res.redirect(back + '&ok=Adjustment+recorded.');
 });
 
 // ---------- performance report + fuel dashboard (owner/editor/viewer) ----------
@@ -744,10 +789,12 @@ router.post('/escrow/withhold-weekly', auth.canEdit, express.urlencoded({ extend
 // (loads.date); the week math lives in dates.js. Gross = linehaul + FSC.
 // Net = gross − driver pay − fuel − insurance − maintenance − factoring −
 // dispatch ("what's left for ALGO" per truck), where:
-//  - driver pay is per load from the driver's own rule: per-mile rate ×
-//    loaded miles, or pay % × LINEHAUL (never gross). A load with no driver
-//    (or a per-mile driver with no rate) counts $0 pay and flags the
-//    truck-week's net as partial.
+//  - driver pay is per load from the ONE pay engine (src/pay.js): the
+//    driver's pay profile in effect on the load's delivery date — % of
+//    gross, % of linehaul, or per-mile × loaded miles. A load with no
+//    driver (or a load the engine flags, e.g. no FSC split on file for a
+//    %-of-linehaul driver) counts $0 pay and flags the truck-week's net
+//    as partial.
 //  - fuel is the truck's recorded fuel expenses for the week, or — when a
 //    truck-week has none recorded — an estimate at total miles ÷ 6.5 mpg ×
 //    $5.50/gal, flagged 'estimated';
@@ -768,11 +815,11 @@ function loadPayAndFees(l) {
 
   let pay_cents = 0, pay_unknown = false;
   if (!l.driver_id) pay_unknown = true;
-  else if (l.pay_type === 'per_mile') {
-    if (l.pay_rate > 0) pay_cents = Math.round(l.loaded_miles * l.pay_rate * 100);
-    else pay_unknown = true;
-  } else {
-    pay_cents = Math.round((l.linehaul_cents || 0) * (l.pay_pct || 0) / 100);
+  else {
+    const profile = pay.profileFor(l.driver_id, l.delivery_date || l.date, T());
+    const res = pay.payForLoad(profile, l);
+    if (res.exception) pay_unknown = true;
+    else pay_cents = res.pay_cents;
   }
 
   const isTQL = (l.broker || '').trim().toUpperCase() === 'TQL';
@@ -834,9 +881,10 @@ function truckWeeklyRollup() {
   let hasUnassigned = false;
 
   const loads = db.db.prepare(
-    `SELECT l.truck_id, l.date, l.loaded_miles, l.empty_miles, l.linehaul_cents, l.fsc_cents,
+    `SELECT l.truck_id, l.date, l.delivery_date, l.loaded_miles, l.empty_miles,
+       l.linehaul_cents, l.fsc_cents, l.pay_override_cents,
        l.broker, l.notes,
-       d.id AS driver_id, d.pay_type, d.pay_rate, d.pay_pct
+       d.id AS driver_id
      FROM loads l LEFT JOIN drivers d
        ON d.id = l.driver_id AND d.tenant_id = l.tenant_id
      WHERE l.tenant_id = ?`
@@ -1042,13 +1090,16 @@ function driverStats(driverId) {
   const week = revenueBetween(w0, w1, driverId);
   const ytd = revenueBetween(y0, today, driverId);
   const payPct = (drv && drv.pay_pct) || 0;
+  // Pay from the one engine: this week's settlement build (delivery-date
+  // basis, driver's own profile) and YTD from finalized settlements.
+  const weekBuild = pay.buildSettlement(driverId, ws, T());
   const recent = db.listLoads(T(), { driverId, limit: 10 });
   const openLoads = db.listLoads(T(), { driverId, limit: 50 })
     .filter(l => l.status === 'booked' || l.status === 'in_transit');
   return {
     weekStart: ws,
-    week: { ...week, pay: Math.round(week.revenue * payPct / 100) },
-    ytd: { ...ytd, pay: Math.round(ytd.revenue * payPct / 100) },
+    week: { ...week, pay: weekBuild.pay_cents },
+    ytd: { ...ytd, pay: weekBuild.ytd_pay_cents },
     recent, payPct,
     safety: db.latestSafetyScore(driverId, T()),
     trip: db.activeTrip(driverId, T()),
@@ -1071,19 +1122,14 @@ router.get('/driver/loads', auth.requireRoles('driver'), (req, res) => {
 });
 router.get('/driver/settlements', auth.requireRoles('driver'), (req, res) => {
   if (!req.user.driver_id) return res.status(403).send('No driver linked to this login.');
-  const drv = db.getDriver(req.user.driver_id);
-  const perMile = drv && drv.pay_type === 'per_mile' && Number(drv.pay_rate) > 0;
-  const payPct = (drv && drv.pay_pct) || 0;
+  // Same engine as the owner Settlements page (src/pay.js): delivery-date
+  // weeks, the driver's own pay profile, finalized weeks frozen.
   const weeks = recentWeekStarts(26).map(weekStart => {
-    const [w0, w1] = D.weekRange(weekStart);
-    const r = revenueBetween(w0, w1, req.user.driver_id);
-    const pay = perMile
-      ? Math.round(r.loaded_miles * drv.pay_rate * 100)
-      : Math.round(r.revenue * payPct / 100);
-    return { weekStart, loads: r.loads, miles: r.miles, gross: r.revenue, pay,
-      pay_basis: perMile ? `$${Number(drv.pay_rate).toFixed(2)}/mi` : `${payPct}%`,
-      escrow_withheld: db.escrowWithheld(req.user.driver_id, w0, w1) };
-  }).filter(w => w.loads > 0);
+    const s = pay.buildSettlement(req.user.driver_id, weekStart, T());
+    return { weekStart, loads: s.loads, miles: s.miles, gross: s.gross_cents,
+      pay: s.pay_cents, pay_basis: s.pay_basis, net: s.net_cents,
+      status: s.status, escrow_withheld: s.escrow_cents };
+  }).filter(w => w.loads > 0 || w.status === 'finalized');
   const escrow_balance = db.escrowBalance(req.user.driver_id);
   res.send(v.driverSettlements(req.user, weeks, escrow_balance));
 });
@@ -1185,10 +1231,14 @@ router.post('/ratecon', auth.requireRoles('owner', 'editor'),
   const loadedMiles = Number(b.loaded_miles) || 0;
   let linehaulC = toCents(b.linehaul);
   let fscC = b.fsc === '' || b.fsc == null ? null : toCents(b.fsc);
-  // 65c fallback: blank FSC + miles + a stated total -> carve FSC out of the total.
+  // Fallback split (Tree, Nov 13 2026: $0.50/mi — was $0.65 until the
+  // Nov 22 2026 fix): blank FSC + miles + a stated total -> carve the
+  // FSC out of the total at the driver's profile rate. A stated FSC wins.
+  const driverId = b.driver_id ? Number(b.driver_id) : null;
   if (fscC == null && loadedMiles > 0 && linehaulC > 0) {
-    fscC = Math.min(Math.round(loadedMiles * 0.65 * 100), linehaulC);
-    linehaulC -= fscC;
+    const split = pay.splitFallback(linehaulC, loadedMiles, pay.fscRateFor(driverId, T()));
+    fscC = split.fsc_cents;
+    linehaulC = split.linehaul_cents;
   }
   const r = db.upsertLoad({
     external_id: 'load-' + loadNumber,
@@ -1197,9 +1247,10 @@ router.post('/ratecon', auth.requireRoles('owner', 'editor'),
     loaded_miles: loadedMiles, empty_miles: Number(b.empty_miles) || 0,
     linehaul_cents: linehaulC, fsc_cents: fscC || 0,
     broker: b.broker || null,
-    driver_id: b.driver_id ? Number(b.driver_id) : null,
+    driver_id: driverId,
     status: b.status || 'booked',
     notes: b.delivery_date ? ('Deliver ' + b.delivery_date) : null,
+    delivery_date: b.delivery_date || null,
   }, T());
   if (req.file) {
     const dir = path.join(UPLOAD_DIR, 'load_' + r.id);

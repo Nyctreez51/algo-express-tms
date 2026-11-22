@@ -1,18 +1,23 @@
 // Performance Report + Fuel Dashboard aggregations (MorPro-style reporting).
-// Reads only. Driver pay follows the settlement rule: per-mile drivers earn
-// pay_rate x loaded miles; everyone else earns pay_pct % of gross (linehaul + FSC).
+// Reads only. Driver pay comes from the ONE pay engine (src/pay.js): each
+// driver's pay profile in effect on the load's delivery date — % of gross,
+// % of linehaul, or per-mile x loaded miles. (Was: everyone else % of gross.)
 'use strict';
 
 const db = require('./db');
 const D = require('./dates');
+const pay = require('./pay');
 
 const T = () => db.TENANT;
 
-function driverPayFor(d, grossCents, loadedMiles) {
-  if (d && d.pay_type === 'per_mile' && Number(d.pay_rate) > 0) {
-    return Math.round(loadedMiles * d.pay_rate * 100);
-  }
-  return Math.round(grossCents * ((d && d.pay_pct) || 0) / 100);
+// Pay for one load row (needs driver_id + money/miles fields). A load the
+// engine flags (e.g. no FSC split on file) counts $0 here, matching the
+// Truck Weeks "pay unknown" treatment.
+function driverPayFor(load) {
+  if (!load || !load.driver_id) return 0;
+  const profile = pay.profileFor(load.driver_id, load.delivery_date || load.date, T());
+  const res = pay.payForLoad(profile, load);
+  return res.exception ? 0 : res.pay_cents;
 }
 
 function validYmd(s) {
@@ -49,9 +54,7 @@ function performanceReport(q) {
   const byBroker = new Map();
   for (const l of loads) {
     const gross = (l.linehaul_cents || 0) + (l.fsc_cents || 0);
-    const pay = driverPayFor(
-      { pay_type: l.pay_type, pay_pct: l.pay_pct, pay_rate: l.pay_rate },
-      gross, l.loaded_miles || 0);
+    const pay = driverPayFor(l);
     tot.loads += 1; tot.gross += gross; tot.linehaul += l.linehaul_cents || 0;
     tot.fsc += l.fsc_cents || 0; tot.loaded += l.loaded_miles || 0;
     tot.empty += l.empty_miles || 0; tot.pay += pay;

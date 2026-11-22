@@ -290,6 +290,8 @@ ${canE ? `<a class="btn ghost" href="/loads/${load.id}/edit">Edit load</a>` : ''
 <div class="card" style="margin-top:12px"><dl class="kv">
 <dt>Lane</dt><dd style="text-align:left">${esc(load.origin || '—')} → ${esc(load.destination || '—')}</dd>
 <dt>Date</dt><dd>${esc(fmtDate(load.date))}</dd>
+<dt>Delivered</dt><dd>${load.delivery_date ? esc(fmtDate(load.delivery_date)) : '—'}${load.settlement_id ? ' · <b>paid in a finalized settlement</b>' : ''}</dd>
+${load.pay_override_cents != null ? `<dt>Pay override</dt><dd>${fmtMoney(load.pay_override_cents)} flat</dd>` : ''}
 <dt>Miles</dt><dd>${fmtNum((load.loaded_miles || 0) + (load.empty_miles || 0))} (${fmtNum(load.loaded_miles || 0)} loaded + ${fmtNum(load.empty_miles || 0)} empty)</dd>
 <dt>Linehaul</dt><dd>${fmtMoney(load.linehaul_cents || 0)}</dd>
 <dt>Fuel surcharge</dt><dd>${fmtMoney(load.fsc_cents || 0)}</dd>
@@ -326,10 +328,13 @@ function loadForm(l, drivers, trucks, q, isEdit) {
   return `<h1>${isEdit ? 'Edit load' : 'Add load'}</h1>${flash(q)}
 <form class="f card" method="post" action="${isEdit ? '/loads/' + l.id + '/edit' : '/loads/new'}">
 <div class="two">
-<div class="row"><label>Date</label><input name="date" type="date" required value="${esc(l.date || '')}"></div>
+<div class="row"><label>Date (pickup)</label><input name="date" type="date" required value="${esc(l.date || '')}"></div>
 <div class="row"><label>Status</label><select name="status">
 ${['delivered', 'in_transit', 'booked', 'cancelled'].map(s => `<option ${l.status === s ? 'selected' : ''}>${s}</option>`).join('')}
 </select></div></div>
+<div class="two">
+<div class="row"><label>Delivery date (settlement week is set by this)</label><input name="delivery_date" type="date" value="${esc(l.delivery_date || '')}"></div>
+<div class="row"><label>Pay override $ (flat fee, e.g. TONU — beats %/mile math)</label><input name="pay_override" type="number" step="0.01" min="0" value="${l.pay_override_cents != null ? esc((l.pay_override_cents / 100).toFixed(2)) : ''}" placeholder="blank = none"></div></div>
 <div class="two">
 <div class="row"><label>Origin</label><input name="origin" value="${esc(l.origin || '')}" placeholder="Decatur, GA"></div>
 <div class="row"><label>Destination</label><input name="destination" value="${esc(l.destination || '')}" placeholder="Stone Mountain, GA"></div></div>
@@ -393,32 +398,67 @@ ${cats.map(c => `<option value="${c}" ${e.category === c ? 'selected' : ''}>${c}
 
 // ---------- settlements ----------
 function settlementsPage(user, weekStart, weeks, rows, q) {
+  const canE = user.role === 'owner' || user.role === 'editor';
   const groups = {};
   weeks.forEach(w => { const k = w.slice(0, 7); (groups[k] = groups[k] || []).push(w); });
   const opts = Object.keys(groups).map(k =>
     `<optgroup label="${esc(monthLabel(k))}">` + groups[k].map(w =>
       `<option value="${w}" ${w === weekStart ? 'selected' : ''}>${esc(fmtWeekRange(w))}</option>`
     ).join('') + `</optgroup>`).join('');
-  const body = rows.map(r => `<tr><td>${esc(r.name)}</td><td class="num">${r.loads}</td>
+  const signed = (c) => c > 0 ? '+' + fmtMoney(c) : c < 0 ? '−' + fmtMoney(-c) : '—';
+  const body = rows.map(r => {
+    const warn = (r.exceptions && r.exceptions.length)
+      ? `<div style="font-size:11px;color:var(--danger)">${r.exceptions.length} load(s) held: no FSC split on file</div>` : '';
+    const finBtn = canE && r.status !== 'finalized' && (r.loads > 0 || r.adjustments !== 0)
+      ? `<form method="post" action="/settlements/finalize" style="display:inline" onsubmit="return confirm('Finalize ${esc(r.name)} for this week? A finalized settlement is frozen and its loads can never be paid twice.')"><input type="hidden" name="week" value="${esc(weekStart)}"><input type="hidden" name="driver_id" value="${r.id}"><button class="btn small">Finalize</button></form>` : '';
+    return `<tr><td>${esc(r.name)}<div class="mut" style="font-size:11px">${r.status === 'finalized' ? 'finalized — frozen' : 'draft'}</div></td><td class="num">${r.loads}</td>
 <td class="num">${fmtNum(r.miles)}</td><td class="num">${fmtMoney(r.gross)}</td>
-<td class="num">${fmtMoney(r.pay)}<div class="mut" style="font-size:11px">${esc(r.pay_basis || '')}</div></td><td class="num">${fmtMoney(r.ytd_pay)}</td>
-<td class="num">${fmtMoney(r.ytd_loads)}</td>
-<td class="num">${r.escrow_withheld ? fmtMoney(r.escrow_withheld) : '—'}<div class="mut" style="font-size:11px">bal ${fmtMoney(r.escrow_balance || 0)}</div></td></tr>`).join('');
+<td class="num">${fmtMoney(r.pay)}<div class="mut" style="font-size:11px">${esc(r.pay_basis || '')}</div>${warn}</td><td class="num">${fmtMoney(r.ytd_pay)}</td>
+<td class="num">${fmtMoney(r.escrow_withheld)}<div class="mut" style="font-size:11px">bal ${fmtMoney(r.escrow_balance || 0)}</div></td>
+<td class="num">${signed(r.adjustments || 0)}</td>
+<td class="num"><b>${fmtMoney(r.net)}</b></td>
+<td>${finBtn}</td></tr>`;
+  }).join('');
+  const tot = rows.reduce((a, r) => ({
+    loads: a.loads + r.loads, gross: a.gross + r.gross, pay: a.pay + r.pay,
+    escrow: a.escrow + (r.escrow_withheld || 0), adj: a.adj + (r.adjustments || 0), net: a.net + (r.net || 0),
+  }), { loads: 0, gross: 0, pay: 0, escrow: 0, adj: 0, net: 0 });
+  const totRow = rows.length ? `<tr style="border-top:2px solid var(--border)"><td><b>Total cash out (ACH)</b></td><td class="num"><b>${tot.loads}</b></td><td></td>
+<td class="num"><b>${fmtMoney(tot.gross)}</b></td><td class="num"><b>${fmtMoney(tot.pay)}</b></td><td></td>
+<td class="num"><b>${fmtMoney(tot.escrow)}</b></td><td class="num"><b>${signed(tot.adj)}</b></td>
+<td class="num"><b>${fmtMoney(tot.net)}</b></td><td></td></tr>` : '';
+  const drvOpts = rows.map(r => `<option value="${r.id}">${esc(r.name)}</option>`).join('');
   return layout({
     title: 'Settlements', user, active: '/settlements',
     body: `<h1>Settlements</h1>
-<p class="mut" style="margin-bottom:10px">Settlement week runs <b>Friday → Thursday</b>. Driver pay = gross × pay % <i>or</i> loaded miles × per-mile rate, per each driver's terms.</p>
+<p class="mut" style="margin-bottom:10px">Settlement week runs <b>Friday → Thursday</b> by <b>delivery date</b> — a load delivered by Thursday is paid that Friday, and a load delivered earlier but never paid rolls in. Each driver is paid on his own deal (pay profile): <b>% of gross</b>, <b>% of linehaul</b> after the FSC split, or <b>$ per loaded mile</b>. YTD pay is the sum of <b>finalized</b> settlements. Finalize a week to freeze it — finalized loads can never be paid twice, and corrections land as adjustments in a later week.</p>
 ${flash(q)}
 <form method="get" action="/settlements" class="rowflex" style="margin-bottom:12px">
 <label style="margin:0">Week</label>
 <select name="week" onchange="this.form.submit()" style="max-width:320px">${opts}</select></form>
 <div class="tblwrap"><table>
-<tr><th>Driver</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">Pay</th><th class="num">YTD pay</th><th class="num">YTD loads</th><th class="num">Escrow</th></tr>
-${body || '<tr><td colspan="8" class="mut">No loads this week.</td></tr>'}</table></div>
+<tr><th>Driver</th><th class="num">Loads</th><th class="num">Loaded mi</th><th class="num">Gross</th><th class="num">Pay</th><th class="num">YTD pay</th><th class="num">Escrow</th><th class="num">Adjustments</th><th class="num">Net due</th><th></th></tr>
+${body}${totRow || '<tr><td colspan="10" class="mut">No loads this week.</td></tr>'}</table></div>
+${canE ? `<h2 style="margin-top:18px">Record an adjustment</h2>
+<form class="f card" method="post" action="/settlements/adjustments">
+<input type="hidden" name="week" value="${esc(weekStart)}">
+<div class="two">
+<div class="row"><label>Driver</label><select name="driver_id">${drvOpts}</select></div>
+<div class="row"><label>Type</label><select name="kind">
+<option value="deduction">Deduction</option>
+<option value="advance">Advance</option>
+<option value="reimbursement">Reimbursement</option>
+<option value="carryover">Carryover balance</option></select></div></div>
+<div class="two">
+<div class="row"><label>Amount $ (negative takes money back, e.g. -97.67)</label><input name="amount" type="number" step="0.01" required placeholder="-97.67"></div>
+<div class="row"><label>Notes</label><input name="notes" placeholder="e.g. Rate true-up 1 of 3"></div></div>
+<button class="btn">Record adjustment</button>
+<p class="mut" style="margin-top:8px">Adjustments land on the week shown above. A finalized week is frozen — corrections go in a later week.</p>
+</form>
 <form method="post" action="/escrow/withhold-weekly" style="margin-top:12px" class="rowflex">
 <label style="margin:0">Record <b>$100</b> escrow withholding for all active drivers</label>
 <input type="date" name="date" value="${esc(todayStr())}" style="max-width:170px">
-<button class="btn small">Withhold $100 each</button></form>`,
+<button class="btn small">Withhold $100 each</button></form>` : ''}`,
   });
 }
 
@@ -491,13 +531,14 @@ function driverForm(d, q, isEdit) {
 <div class="row"><label>Phone</label><input name="phone" value="${esc(d.phone || '')}"></div></div>
 <div class="two">
 <div class="row"><label>Pay type</label><select name="pay_type">
-${['percent', 'per_mile'].map(s => `<option value="${s}" ${d.pay_type === s ? 'selected' : ''}>${s === 'per_mile' ? 'Per mile' : '% of gross'}</option>`).join('')}</select></div>
-<div class="row"><label>Pay % of gross</label><input name="pay_pct" type="number" step="0.1" min="0" max="100" value="${esc(d.pay_pct ?? 30)}"></div></div>
+${['percent', 'per_mile'].map(s => `<option value="${s}" ${d.pay_type === s ? 'selected' : ''}>${s === 'per_mile' ? 'Per mile' : 'Percent'}</option>`).join('')}</select></div>
+<div class="row"><label>Pay %</label><input name="pay_pct" type="number" step="0.1" min="0" max="100" value="${esc(d.pay_pct ?? 30)}"></div></div>
 <div class="row"><label>Per-mile rate ($/loaded mi, only if pay type is Per mile)</label><input name="pay_rate" type="number" step="0.01" min="0" value="${esc(d.pay_rate ?? '')}" placeholder="0.65"></div>
 <div class="two">
 <div class="row"><label>Status</label><select name="status">
 ${['active', 'inactive'].map(s => `<option ${d.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select></div></div>
 <div class="row"><label>Notes</label><textarea name="notes" rows="2">${esc(d.notes || '')}</textarea></div>
+<p class="mut">Settlements pay from the driver's effective-dated <b>pay profile</b> (% of gross, % of linehaul, or per-mile) — these fields are a cache of the current profile. A rate change needs a new profile row so history is never rewritten; ask Merlin to add one.</p>
 <button class="btn">Save driver</button>
 <a class="btn ghost" href="/drivers" style="margin-left:8px">Cancel</a></form>`;
 }
@@ -647,7 +688,7 @@ ${table}`;
   return layout({
     title: 'Truck weeks', user, active: '/trucks/weekly',
     body: `<h1>Trucks — weekly mileage, gross &amp; net</h1>
-<p class="mut" style="margin-bottom:6px">Each truck shows gross for <b>today</b>, <b>this week</b>, <b>this month</b> and <b>year to date</b> up top, then the week-by-week detail. Weeks are settlement weeks (<b>Friday → Thursday</b>), by pickup date. Gross = linehaul + fuel surcharge. <b>Net</b> = gross − driver pay − fuel − insurance − maintenance − factoring − dispatch. Driver pay: per-mile rate × loaded miles, or pay % × linehaul. Fuel: recorded fuel expenses where the truck has them, otherwise estimated at total miles ÷ 6.5 mpg × $5.50/gal (marked <i>estimated</i>). Insurance: $3,000/month per-truck allocation ($692.31/week). Maintenance: recorded expenses only. Factoring: TQL → QAP 2.0% of gross, other brokers → NONRECOURSE 2.7%, unless the load record names an account. Dispatch: Erica 7% · Hybrid 3% · self-booked/RXO 0%, per the dispatcher the load record names. Year-to-date totals are the current calendar year, pickup-date basis.</p>
+<p class="mut" style="margin-bottom:6px">Each truck shows gross for <b>today</b>, <b>this week</b>, <b>this month</b> and <b>year to date</b> up top, then the week-by-week detail. Weeks are settlement weeks (<b>Friday → Thursday</b>), by pickup date. Gross = linehaul + fuel surcharge. <b>Net</b> = gross − driver pay − fuel − insurance − maintenance − factoring − dispatch. Driver pay: the settlements engine — each driver's pay profile (% of gross, % of linehaul after the FSC split, or per-mile × loaded miles). Fuel: recorded fuel expenses where the truck has them, otherwise estimated at total miles ÷ 6.5 mpg × $5.50/gal (marked <i>estimated</i>). Insurance: $3,000/month per-truck allocation ($692.31/week). Maintenance: recorded expenses only. Factoring: TQL → QAP 2.0% of gross, other brokers → NONRECOURSE 2.7%, unless the load record names an account. Dispatch: Erica 7% · Hybrid 3% · self-booked/RXO 0%, per the dispatcher the load record names. Year-to-date totals are the current calendar year, pickup-date basis.</p>
 ${sections || '<p class="mut">No trucks yet.</p>'}`,
   });
 }
@@ -841,19 +882,20 @@ ${docsTable(docs, { canManage: false, docBase: '/driver/documents' })}`;
 }
 
 function driverSettlements(user, weeks, escrowBalance) {
-  const rows = weeks.map(w => `<tr><td>${esc(fmtWeekRange(w.weekStart))}</td>
+  const rows = weeks.map(w => `<tr><td>${esc(fmtWeekRange(w.weekStart))}${w.status === 'finalized' ? '<div class="mut" style="font-size:11px">finalized</div>' : ''}</td>
 <td class="num">${w.loads}</td><td class="num">${fmtNum(w.miles)}</td>
 <td class="num">${fmtMoney(w.gross)}</td><td class="num"><b>${fmtMoney(w.pay)}</b><div class="mut" style="font-size:11px">${esc(w.pay_basis || '')}</div></td>
-<td class="num">${w.escrow_withheld ? fmtMoney(w.escrow_withheld) : '—'}</td></tr>`).join('');
+<td class="num">${w.escrow_withheld ? fmtMoney(w.escrow_withheld) : '—'}</td>
+<td class="num"><b>${fmtMoney(w.net != null ? w.net : w.pay - (w.escrow_withheld || 0))}</b></td></tr>`).join('');
   const balLine = escrowBalance ? `<p style="margin-bottom:10px"><b>Escrow balance: ${fmtMoney(escrowBalance)}</b> <span class="mut">($100/week withholding)</span></p>` : '';
   return layout({
     title: 'My settlements', user, active: '/driver/settlements',
     body: `<h1>My settlements</h1>
-<p class="mut" style="margin-bottom:10px">Settlement week runs <b>Friday → Thursday</b>.</p>
+<p class="mut" style="margin-bottom:10px">Settlement week runs <b>Friday → Thursday</b>, by delivery date.</p>
 ${balLine}
 <div class="tblwrap"><table>
-<tr><th>Week</th><th class="num">Loads</th><th class="num">Miles</th><th class="num">Gross</th><th class="num">Pay</th><th class="num">Escrow held</th></tr>
-${rows || '<tr><td colspan="6" class="mut">No settlements yet.</td></tr>'}</table></div>`,
+<tr><th>Week</th><th class="num">Loads</th><th class="num">Loaded mi</th><th class="num">Gross</th><th class="num">Pay</th><th class="num">Escrow held</th><th class="num">Net</th></tr>
+${rows || '<tr><td colspan="7" class="mut">No settlements yet.</td></tr>'}</table></div>`,
   });
 }
 
@@ -962,7 +1004,7 @@ ${hiddenParsed}
 <div class="two">
 <div class="row"><label>Linehaul $</label><input name="linehaul" type="number" step="0.01" min="0" ${val('linehaul')}></div>
 <div class="row"><label>FSC $ (if stated)</label><input name="fsc" type="number" step="0.01" min="0" ${val('fsc')}></div></div>
-<p class="mut">If the rate con shows one total with no FSC breakdown, put the total in Linehaul and leave FSC blank — the system carves out $0.65 × loaded miles as the FSC. Enter 0 for FSC to keep it all as linehaul.</p>
+<p class="mut">If the rate con shows one total with no FSC breakdown, put the total in Linehaul and leave FSC blank — the system carves out $0.50 × loaded miles as the FSC. Enter 0 for FSC to keep it all as linehaul.</p>
 <div class="two">
 <div class="row"><label>Broker</label><input name="broker" ${val('broker')} placeholder="e.g. J.B. Hunt"></div>
 <div class="row"><label>Status</label><select name="status">${statusOpts}</select></div></div>
@@ -1057,7 +1099,7 @@ function analyzerPage(user, drivers, q) {
   return layout({
     title: 'Load analyzer', user, active: '/analyzer',
     body: `<h1>Load analyzer</h1>${flash(q)}
-<p class="mut" style="margin-bottom:12px">Run the numbers before you book. Uses your FSC rule (65¢ x loaded miles carved out of gross), the driver's own pay terms, RXO fuel prices near the pickup, and $147/day fixed cost — all editable.</p>
+<p class="mut" style="margin-bottom:12px">Run the numbers before you book. Uses your FSC rule (50¢ x loaded miles carved out of gross), the driver's own pay terms, RXO fuel prices near the pickup, and $147/day fixed cost — all editable.</p>
 <form id="azform" class="f card" onsubmit="return false">
 <div class="two">
 <div class="row"><label>Pickup (City, ST)</label><input id="az-origin" placeholder="Rincon, GA" required></div>
@@ -1157,7 +1199,7 @@ function driverAnalyzerPage(user, q) {
   return layout({
     title: 'Load analyzer', user, active: '/driver/analyzer',
     body: `<h1>Load analyzer</h1>${flash(q)}
-<p class="mut" style="margin-bottom:12px">Run the numbers before you take a load. Type in what they're offering and it shows your truck cost per mile and tells you straight whether the load is worth taking. Uses your own pay terms, the 65¢ x loaded miles fuel surcharge rule, RXO fuel prices near the pickup, and $147/day fixed cost — all editable.</p>
+<p class="mut" style="margin-bottom:12px">Run the numbers before you take a load. Type in what they're offering and it shows your truck cost per mile and tells you straight whether the load is worth taking. Uses your own pay terms, the 50¢ x loaded miles fuel surcharge rule, RXO fuel prices near the pickup, and $147/day fixed cost — all editable.</p>
 <form id="dazform" class="f card" onsubmit="return false">
 <div class="two">
 <div class="row"><label>Pickup (City, ST)</label><input id="daz-origin" placeholder="Rincon, GA" value="${esc(q.origin || '')}" required></div>
@@ -1279,7 +1321,7 @@ function performancePage(user, d, q, drivers, trucks, presets) {
   }).join('') || '<tr><td colspan="5" class="mut">No delivered loads in this range.</td></tr>';
   return layout({ title: 'Performance report', user, active: '/performance',
     body: `<h1>Performance report</h1>${presetLinks(presets, '/performance')}${rangeForm('/performance', q, extra)}
-<p class="mut" style="margin:0 0 12px">Delivered loads from ${esc(d.from)} to ${esc(d.to)} · driver pay at current terms (settlement rules: per-mile drivers on loaded miles, everyone else % of gross) · deadhead ${t.deadheadPct.toFixed(1)}% of miles.</p>
+<p class="mut" style="margin:0 0 12px">Delivered loads from ${esc(d.from)} to ${esc(d.to)} · driver pay per the settlements engine (each driver on his pay profile: % of gross, % of linehaul, or per loaded mile) · deadhead ${t.deadheadPct.toFixed(1)}% of miles.</p>
 <div class="grid">
 ${statCard('Gross', fmtMoney(t.gross), `${t.loads} delivered loads`)}
 ${statCard('Total miles', fmtNum(t.miles), `${fmtNum(t.loaded)} loaded + ${fmtNum(t.empty)} empty`)}
