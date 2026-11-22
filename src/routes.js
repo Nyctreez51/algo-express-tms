@@ -445,6 +445,43 @@ router.get('/dashboard', auth.requireRoles('owner', 'editor', 'viewer'), (req, r
   res.send(v.dashboardPage(req.user, dashboardData(req.query.month)));
 });
 
+// ----- dashboard · weekly tab -----
+// Week-to-week view inside one month. Same basis as the dashboard Month
+// card: loads by pickup date (loads.date), gross = linehaul + FSC, via
+// revenueBetween. Weeks are the TMS Fri–Thu weeks; a week that straddles
+// a month boundary counts only its days inside the selected month, so
+// the weekly rows sum exactly to the dashboard Month total.
+function shiftMonth(ym, delta) {
+  const [y, m] = ym.split('-').map(Number);
+  const d = new Date(y, m - 1 + delta, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function weeklyDashboardData(monthYm) {
+  const months = D.recentMonths(12);
+  if (!monthYm || !/^\d{4}-\d{2}$/.test(monthYm)) monthYm = months[0];
+  const [m0, m1] = D.monthRange(monthYm);
+  const weeks = [];
+  for (let ws = D.weekStartOf(m0); ws <= m1; ws = D.addDaysStr(ws, 7)) {
+    const [w0full, w1full] = D.weekRange(ws);
+    const from = w0full < m0 ? m0 : w0full;
+    const to = w1full > m1 ? m1 : w1full;
+    const r = revenueBetween(from, to);
+    weeks.push({ weekStart: ws, from, to, loads: r.loads, revenue: r.revenue, miles: r.miles });
+  }
+  return {
+    monthYm, months,
+    prevMonth: shiftMonth(monthYm, -1),
+    nextMonth: shiftMonth(monthYm, 1),
+    weeks,
+    month: revenueBetween(m0, m1),
+  };
+}
+
+router.get('/dashboard/weekly', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  res.send(v.dashboardWeeklyPage(req.user, weeklyDashboardData(req.query.month)));
+});
+
 // ----- loads -----
 router.get('/loads', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
   const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : null;

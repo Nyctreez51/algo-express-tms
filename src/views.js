@@ -213,11 +213,22 @@ if(b&&i){b.addEventListener('click',function(){
   });
 }
 
+// Dashboard Month / Weekly tabs. `active` is 'month' or 'weekly'.
+function dashboardTabs(monthYm, active) {
+  const tab = (href, label, key) =>
+    `<a class="btn small ${active === key ? '' : 'ghost'}" href="${href}">${label}</a>`;
+  return `<div class="rowflex" style="margin-bottom:12px">
+${tab(`/dashboard?month=${esc(monthYm)}`, 'Month', 'month')}
+${tab(`/dashboard/weekly?month=${esc(monthYm)}`, 'Weekly', 'weekly')}
+</div>`;
+}
+
 // ---------- dashboard ----------
 function dashboardPage(user, d) {
   const monthOpts = (d.months || recentMonths(12)).map(m =>
     `<option value="${m}" ${m === d.monthYm ? 'selected' : ''}>${esc(monthLabel(m))}</option>`).join('');
   const cards = `
+${dashboardTabs(d.monthYm, 'month')}
 <form method="get" action="/dashboard" class="rowflex" style="margin-bottom:12px">
 <label style="margin:0">Month</label>
 <select name="month" onchange="this.form.submit()" style="max-width:220px">${monthOpts}</select></form>
@@ -251,6 +262,35 @@ ${d.expCats.map(c => `<tr><td style="text-transform:capitalize">${esc(c.category
 ${d.expTrucks.map(c => `<tr><td>${esc(c.label)}</td><td class="num">${fmtMoney(c.total)}</td></tr>`).join('') || '<tr><td colspan="2" class="mut">No data yet.</td></tr>'}
 </table></div>`;
   return layout({ title: 'Dashboard', user, active: '/dashboard', body: `<h1>Dashboard</h1>${cards}` });
+}
+
+// ---------- dashboard · weekly tab ----------
+// Week-to-week inside the selected month. Weeks are Fri–Thu (settlement
+// weeks), by pickup date — same basis as the dashboard Month card, so the
+// rows sum to the Month total. A week straddling a month boundary counts
+// only its days inside this month.
+function dashboardWeeklyPage(user, d) {
+  const monthOpts = (d.months || recentMonths(12)).map(m =>
+    `<option value="${m}" ${m === d.monthYm ? 'selected' : ''}>${esc(monthLabel(m))}</option>`).join('');
+  const rows = d.weeks.map(w => `<tr>
+<td><a href="/loads?month=${esc(d.monthYm)}">${esc(fmtWeekRange(w.weekStart))}</a></td>
+<td class="num">${w.loads}</td><td class="num">${fmtMoney(w.revenue)}</td></tr>`).join('');
+  const body = `<h1>Dashboard</h1>
+${dashboardTabs(d.monthYm, 'weekly')}
+<div class="rowflex" style="margin-bottom:12px">
+<a class="btn small ghost" href="/dashboard/weekly?month=${esc(d.prevMonth)}">← ${esc(monthLabel(d.prevMonth))}</a>
+<form method="get" action="/dashboard/weekly" class="rowflex" style="margin:0">
+<label style="margin:0">Month</label>
+<select name="month" onchange="this.form.submit()" style="max-width:220px">${monthOpts}</select></form>
+<a class="btn small ghost" href="/dashboard/weekly?month=${esc(d.nextMonth)}">${esc(monthLabel(d.nextMonth))} →</a>
+</div>
+<h2>Week by week · ${esc(monthLabel(d.monthYm))}</h2>
+<p class="mut" style="margin-bottom:6px">Weeks run <b>Friday → Thursday</b>, by pickup date — the same basis as the dashboard Month total. A week that straddles the month boundary counts only its days inside ${esc(monthLabel(d.monthYm))}, so the weeks add up to the month total.</p>
+<div class="tblwrap"><table><tr><th>Week (Fri–Thu)</th><th class="num">Loads</th><th class="num">Gross</th></tr>
+${rows || '<tr><td colspan="3" class="mut">No loads this month.</td></tr>'}
+<tr><td><b>${esc(monthLabel(d.monthYm))} total</b></td><td class="num"><b>${d.month.loads}</b></td><td class="num"><b>${fmtMoney(d.month.revenue)}</b></td></tr>
+</table></div>`;
+  return layout({ title: 'Dashboard · Weekly', user, active: '/dashboard', body });
 }
 
 // ---------- loads ----------
@@ -1378,7 +1418,7 @@ ${trendRows}</table></div>
 module.exports = {
   esc, layout, flash,
   setupPage, loginPage,
-  dashboardPage, loadsPage, loadForm, loadDetailPage,
+  dashboardPage, dashboardWeeklyPage, loadsPage, loadForm, loadDetailPage,
   expensesPage, expenseForm,
   settlementsPage, driversPage, driverForm, escrowPage, trucksPage, truckForm, truckWeeklyPage,
   brokersPage,
