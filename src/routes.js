@@ -340,6 +340,22 @@ router.get('/api/v1/trucks/weekly', apiAuth, (req, res) => {
 router.get('/api/v1/positions', apiAuth, (req, res) => {
   res.json({ ok: true, positions: db.listMotivePositions(req.tenantId) });
 });
+// Open phone-tracking trips (what the fleet map draws as driver pins).
+router.get('/api/v1/trips', apiAuth, (req, res) => {
+  res.json({ ok: true, trips: db.fleetSnapshot(req.tenantId) });
+});
+// End ALL open trips for one driver (clears a stale map pin). Body:
+// {driver_name} or {driver_id}.
+router.post('/api/v1/trips/end', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  const d = b.driver_id ? db.getDriver(Number(b.driver_id), req.tenantId)
+    : (b.driver_name ? db.findDriverByName(String(b.driver_name).trim(), req.tenantId) : null);
+  if (!d) return res.status(404).json({ ok: false, error: 'driver not found' });
+  const ended = [];
+  let id = db.endTrip(d.id, req.tenantId);
+  while (id) { ended.push(id); id = db.endTrip(d.id, req.tenantId); }
+  res.json({ ok: true, driver: d.name, ended_trip_ids: ended });
+});
 router.get('/api/v1/expenses', apiAuth, (req, res) => {
   res.json({ ok: true, expenses: db.listExpenses(req.tenantId, { limit: 2000 }) });
 });
