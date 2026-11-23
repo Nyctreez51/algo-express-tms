@@ -341,6 +341,7 @@ router.get('/api/v1/positions', apiAuth, (req, res) => {
   res.json({ ok: true, positions: db.listMotivePositions(req.tenantId) });
 });
 // Open phone-tracking trips (what the fleet map draws as driver pins).
+// (Added 2026-11-23 to clear stale pins, e.g. a trip left open after a run.)
 router.get('/api/v1/trips', apiAuth, (req, res) => {
   res.json({ ok: true, trips: db.fleetSnapshot(req.tenantId) });
 });
