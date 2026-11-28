@@ -111,7 +111,8 @@ function navFor(user) {
     + link('/settlements', 'Settlements', '/settlements')
     + link('/trucks/weekly', 'Truck weeks', '/trucks/weekly');
   if (r === 'owner' || r === 'editor') {
-    links += link('/drivers', 'Drivers', '/drivers') + link('/trucks', 'Trucks', '/trucks');
+    links += link('/factoring', 'Factoring', '/factoring')
+      + link('/drivers', 'Drivers', '/drivers') + link('/trucks', 'Trucks', '/trucks');
   }
   if (r === 'owner') {
     links += link('/users', 'Users', '/users') + link('/api-docs', 'API', '/api-docs');
@@ -339,8 +340,33 @@ ${rows || '<tr><td colspan="8" class="mut">No loads yet.</td></tr>'}</table></di
   });
 }
 
+const FACT_STATUS_PILL = {
+  draft: 'amber', ready: 'amber', submitted: '', purchased: 'green',
+  funded: 'green', held: 'amber', void: '',
+};
+function factoringCard(load, fact) {
+  if (!fact) {
+    return `<h2>Factoring</h2><div class="card"><p class="mut" style="margin:0">No factoring
+invoice yet. One drafts automatically when this load is delivered with a POD attached —
+or from the <a href="/factoring">Factoring board</a>.</p></div>`;
+  }
+  const feeLine = fact.actual_fee_cents != null
+    ? `${fmtMoney(fact.actual_fee_cents)} actual`
+    : `${fmtMoney(fact.expected_fee_cents || 0)} expected`;
+  return `<h2>Factoring</h2><div class="card"><dl class="kv">
+<dt>Status</dt><dd style="text-align:left"><span class="pill ${FACT_STATUS_PILL[fact.status] || ''}">${esc(fact.status)}</span>
+<a href="/factoring/${fact.id}">invoice ${esc(fact.invoice_number)}</a></dd>
+<dt>Account</dt><dd style="text-align:left">${esc(fact.account)}${fact.account === 'QAP' ? ' (QAP W/ TQL · 168612QAP)' : ' (NONRECOURSE · 168612NONREC)'}</dd>
+<dt>PO #</dt><dd>${esc(fact.po_number || '— not set')}</dd>
+<dt>Amount</dt><dd>${fmtMoney(fact.amount_cents)}</dd>
+<dt>Fee</dt><dd>${feeLine}</dd>
+${fact.funded_cents != null ? `<dt>Funded</dt><dd>${fmtMoney(fact.funded_cents)}</dd>` : ''}
+${fact.hold_reason ? `<dt>Hold reason</dt><dd style="text-align:left">${esc(fact.hold_reason)}</dd>` : ''}
+</dl></div>`;
+}
+
 // Load detail: facts + rate confirmations / PODs. Upload + delete need editor/owner.
-function loadDetailPage(user, load, docs, q) {
+function loadDetailPage(user, load, docs, q, fact = null) {
   const canE = user.role === 'owner' || user.role === 'editor';
   const gross = (load.linehaul_cents || 0) + (load.fsc_cents || 0);
   const body = `${flash(q)}
@@ -361,7 +387,10 @@ ${load.pay_override_cents != null ? `<dt>Pay override</dt><dd>${fmtMoney(load.pa
 <dt>Truck</dt><dd style="text-align:left">${esc(load.truck_label || '—')}</dd>
 <dt>Status</dt><dd style="text-align:left">${esc(load.status || '')}</dd>
 ${load.notes ? `<dt>Notes</dt><dd style="text-align:left">${esc(load.notes)}</dd>` : ''}
+${load.detention_cents ? `<dt>Detention</dt><dd>${fmtMoney(load.detention_cents)}</dd>` : ''}
+${load.accessorial_cents ? `<dt>Accessorials</dt><dd>${fmtMoney(load.accessorial_cents)}${load.accessorial_notes ? ' — ' + esc(load.accessorial_notes) : ''}</dd>` : ''}
 </dl></div>
+${factoringCard(load, fact)}
 <h2>Documents — rate confirmations &amp; PODs</h2>
 ${docsTable(docs, { canManage: canE, docBase: '/documents' })}
 ${canE ? `<h2>Attach documents</h2>
@@ -404,6 +433,10 @@ ${['delivered', 'in_transit', 'booked', 'cancelled'].map(s => `<option ${l.statu
 <div class="two">
 <div class="row"><label>Linehaul $</label><input name="linehaul" type="number" step="0.01" min="0" value="${l.linehaul_cents != null ? esc((l.linehaul_cents / 100).toFixed(2)) : ''}"></div>
 <div class="row"><label>Fuel surcharge $</label><input name="fsc" type="number" step="0.01" min="0" value="${l.fsc_cents != null ? esc((l.fsc_cents / 100).toFixed(2)) : ''}"></div></div>
+<div class="two">
+<div class="row"><label>Detention $ (billed on the factoring invoice)</label><input name="detention" type="number" step="0.01" min="0" value="${l.detention_cents != null ? esc((l.detention_cents / 100).toFixed(2)) : ''}" placeholder="blank = none"></div>
+<div class="row"><label>Accessorials $ (billed on the factoring invoice)</label><input name="accessorial" type="number" step="0.01" min="0" value="${l.accessorial_cents != null ? esc((l.accessorial_cents / 100).toFixed(2)) : ''}" placeholder="blank = none"></div></div>
+<div class="row"><label>Accessorial notes</label><input name="accessorial_notes" value="${esc(l.accessorial_notes || '')}" placeholder="e.g. lumper, layover"></div>
 <div class="two">
 <div class="row"><label>Broker / shipper</label><input name="broker" value="${esc(l.broker || '')}"></div>
 <div class="row"><label>External ID (sheet sync)</label><input name="external_id" value="${esc(l.external_id || '')}"></div></div>
@@ -1484,7 +1517,200 @@ ${payTot}
 <tr><td><a href="/trucks/weekly">Truck weeks</a></td><td>Week-by-week gross, pay, fuel and net per truck</td></tr>
 <tr><td><a href="/settlements">Settlements</a></td><td>Weekly settlement drafts and finalized statements per driver</td></tr>
 </table></div>
-<p class="mut">On the roadmap (see the factoring design): <strong>AR aging</strong> and the <strong>factoring board</strong> arrive with invoice tracking on loads; <strong>detention &amp; accessorials</strong> reporting arrives when those charges are captured on the load; <strong>miles by state</strong> arrives with the Motive mileage import for IFTA. Nothing here estimates them in the meantime.</p>` });
+<p class="mut">Live now: the <a href="/factoring"><strong>factoring board</strong></a> tracks every invoice from draft to funded. On the roadmap: <strong>AR aging</strong> reads from those invoice records next; <strong>detention &amp; accessorials</strong> are captured on the load form now and report once volume exists; <strong>miles by state</strong> arrives with the Motive mileage import for IFTA. Nothing here estimates them in the meantime.</p>` });
+}
+
+// ---------- factoring (Phase A board) ----------
+function factStatusPill(s) {
+  return `<span class="pill ${FACT_STATUS_PILL[s] || ''}">${esc(s)}</span>`;
+}
+function factRow(inv, { actions = '' } = {}) {
+  return `<tr><td><a href="/factoring/${inv.id}">${esc(inv.invoice_number)}</a></td>
+<td>${esc(inv.broker || '—')}</td><td>${esc(inv.driver_name || '—')}</td>
+<td>${esc(inv.origin || '')} → ${esc(inv.destination || '')}</td>
+<td>${esc(inv.account)}${inv.scope === 'other' ? ' <span class="pill">other scope</span>' : ''}</td>
+<td>${esc(inv.po_number || '—')}</td>
+<td class="num">${fmtMoney(inv.amount_cents)}</td>
+<td class="num">${fmtMoney(inv.expected_fee_cents || 0)}</td>
+<td>${factStatusPill(inv.status)}</td><td>${actions}</td></tr>`;
+}
+const FACT_TBL_HEAD = `<tr><th>Invoice</th><th>Broker</th><th>Driver</th><th>Lane</th><th>Account</th><th>PO #</th><th class="num">Amount</th><th class="num">Exp. fee</th><th>Status</th><th></th></tr>`;
+
+function factoringPage(user, d, q) {
+  const isOwner = user.role === 'owner';
+  const canE = isOwner || user.role === 'editor';
+  const approveBtn = (inv) => isOwner
+    ? `<form method="post" action="/factoring/${inv.id}/approve" style="margin:0"><button class="btn small">Approve</button></form>` : '';
+  const drafts = d.drafts.map(i => factRow(i, { actions: approveBtn(i) })).join('')
+    || '<tr><td colspan="10" class="mut">No drafts waiting. Drafts appear when a load delivers with a POD attached.</td></tr>';
+  const readyRows = d.ready.map(i => factRow(i)).join('')
+    || '<tr><td colspan="10" class="mut">Nothing approved yet.</td></tr>';
+  const subRows = d.submitted.map(i => factRow(i)).join('')
+    || '<tr><td colspan="10" class="mut">Nothing awaiting purchase.</td></tr>';
+  const heldRows = d.held.map(i => `<tr><td><a href="/factoring/${i.id}">${esc(i.invoice_number)}</a></td>
+<td colspan="3">${esc(i.hold_reason || 'Held — no reason recorded')}</td>
+<td>${esc(i.account)}</td><td>${esc(i.po_number || '—')}</td>
+<td class="num">${fmtMoney(i.amount_cents)}</td><td class="num">${fmtMoney(i.expected_fee_cents || 0)}</td>
+<td>${factStatusPill(i.status)}</td><td></td></tr>`).join('')
+    || '<tr><td colspan="10" class="mut">No held invoices.</td></tr>';
+  const fundedRows = d.fundedThisWeek.map(i => factRow(i)).join('')
+    || '<tr><td colspan="10" class="mut">Nothing funded in the last 7 days.</td></tr>';
+  const podRows = d.missingPod.map(l => `<tr><td><a href="/loads/${l.id}">${esc(l.external_id ? String(l.external_id).replace(/^load-/i, '') : String(l.id))}</a></td>
+<td colspan="3">${esc(l.origin || '')} → ${esc(l.destination || '')} · delivered ${esc(l.delivery_date || '—')}</td>
+<td colspan="2">${esc(l.driver_name || '—')}${l.scope === 'other' ? ' <span class="pill">other scope</span>' : ''}</td>
+<td class="num">${fmtMoney((l.linehaul_cents || 0) + (l.fsc_cents || 0))}</td><td></td>
+<td><span class="pill amber">NO POD</span></td><td></td></tr>`).join('')
+    || '<tr><td colspan="10" class="mut">Every delivered load has a POD on file.</td></tr>';
+  const submitLinks = isOwner ? `<div class="rowflex" style="margin:10px 0">
+<a class="btn" href="/factoring/submit?account=NONRECOURSE">Submit NONRECOURSE batch →</a>
+<a class="btn" href="/factoring/submit?account=QAP">Submit QAP (TQL) batch →</a></div>
+<p class="mut">Phase A: the submit screen is the RTS-ready packet (account, PO #, documents, note).
+You submit it in the RTS portal, then confirm here — the TMS records the batch as submitted.
+RTS submits everything in an account at once, so the batch lists every invoice it will carry.</p>` : '';
+  return layout({ title: 'Factoring', user, active: '/factoring',
+    body: `${flash(q)}<h1>Factoring — RTS</h1>
+<div class="grid">
+<div class="card stat"><div class="lbl">Drafts awaiting approval</div><div class="val">${d.drafts.length}</div></div>
+<div class="card stat"><div class="lbl">Submitted, awaiting purchase</div><div class="val">${d.submitted.length}</div></div>
+<div class="card stat"><div class="lbl">Held</div><div class="val">${d.held.length}</div></div>
+<div class="card stat"><div class="lbl">Purchased volume, prior 30 days</div><div class="val">${fmtMoney(d.volume30)}</div>
+<div class="sub">Amendment #2 tier is set by this · US Prime ${esc(String(d.primeRate))}% (adder ${esc(String(Math.max(0, d.primeRate - 6.75).toFixed(2)))}%)</div></div>
+</div>
+${isOwner ? `<form class="f card" method="post" action="/factoring/prime" style="margin-top:12px">
+<div class="rowflex"><div class="row" style="margin:0;min-width:200px"><label>US Prime rate % (fee adder = Prime − 6.75%)</label>
+<input name="prime" type="number" step="0.01" min="1" max="30" value="${esc(String(d.primeRate))}"></div>
+<button class="btn small">Save prime rate</button></div></form>` : ''}
+<h2>⚠ Delivered with no POD — flag today</h2>
+<div class="tblwrap"><table>${FACT_TBL_HEAD}${podRows}</table></div>
+<h2>Drafts — approval queue</h2>
+<div class="tblwrap"><table>${FACT_TBL_HEAD}${drafts}</table></div>
+<h2>Ready to submit</h2>
+${submitLinks}
+<div class="tblwrap"><table>${FACT_TBL_HEAD}${readyRows}</table></div>
+<h2>Submitted — awaiting RTS purchase</h2>
+<div class="tblwrap"><table>${FACT_TBL_HEAD}${subRows}</table></div>
+<h2>Held by RTS</h2>
+<div class="tblwrap"><table>${FACT_TBL_HEAD}${heldRows}</table></div>
+<h2>Funded this week</h2>
+<div class="tblwrap"><table>${FACT_TBL_HEAD}${fundedRows}</table></div>
+<p class="mut">Scope: the submit queue carries Parker + Thompson loads (Merlin's factoring). Other drivers'
+invoices are tracked here but marked "other scope" — Erica factors her own bookings. Submitted ≠ purchased:
+an invoice counts as revenue in AR only when RTS buys it.</p>` });
+}
+
+function factoringDetailPage(user, inv, docs, q) {
+  const isOwner = user.role === 'owner';
+  const canE = isOwner || user.role === 'editor';
+  const tl = [
+    ['Drafted', inv.created_at], ['Submitted', inv.submitted_at],
+    ['Purchased', inv.purchased_at], ['Funded', inv.funded_at],
+  ].filter(([, t]) => t).map(([label, t]) =>
+    `<tr><td>${label}</td><td>${esc(String(t).slice(0, 16).replace('T', ' '))}</td></tr>`).join('');
+  const statusForm = canE ? `<h2>Record RTS status</h2>
+<form class="f card" method="post" action="/factoring/${inv.id}/status">
+<div class="two">
+<div class="row"><label>Status</label><select name="status">
+${['submitted', 'purchased', 'funded', 'held', 'void'].map(s => `<option value="${s}" ${inv.status === s ? 'selected' : ''}>${s}</option>`).join('')}
+</select></div>
+<div class="row"><label>Payout method</label><input value="${esc(inv.payout_method || '')}" disabled></div></div>
+<div class="two">
+<div class="row"><label>Funded amount $ (what RTS paid)</label><input name="funded" type="number" step="0.01" min="0" value="${inv.funded_cents != null ? esc((inv.funded_cents / 100).toFixed(2)) : ''}"></div>
+<div class="row"><label>Actual fee $</label><input name="actual_fee" type="number" step="0.01" min="0" value="${inv.actual_fee_cents != null ? esc((inv.actual_fee_cents / 100).toFixed(2)) : ''}"></div></div>
+<div class="row"><label>Hold reason (RTS's words, verbatim)</label><input name="hold_reason" value="${esc(inv.hold_reason || '')}"></div>
+<button class="btn">Save status</button>
+<p class="mut" style="margin-top:8px">Phase A: record what the RTS portal shows. Submitted is not purchased — save each step as RTS reports it.</p>
+</form>` : '';
+  return layout({ title: 'Invoice ' + inv.invoice_number, user, active: '/factoring',
+    body: `${flash(q)}<div class="rowflex"><h1 style="margin:0">Invoice ${esc(inv.invoice_number)}</h1>
+<div class="spacer"></div><a class="btn ghost" href="/factoring">Factoring board</a>
+<a class="btn ghost" href="/loads/${inv.load_id}">Load</a></div>
+<div class="card" style="margin-top:12px"><dl class="kv">
+<dt>Status</dt><dd style="text-align:left">${factStatusPill(inv.status)}${inv.advanced ? ' · <b>advanced on settlement</b> (paid before funding)' : ''}</dd>
+<dt>Broker</dt><dd style="text-align:left">${esc(inv.broker || '—')}</dd>
+<dt>Driver</dt><dd style="text-align:left">${esc(inv.driver_name || '—')}${inv.scope === 'other' ? ' (other scope)' : ''}</dd>
+<dt>Lane</dt><dd style="text-align:left">${esc(inv.origin || '')} → ${esc(inv.destination || '')}</dd>
+<dt>Account</dt><dd style="text-align:left">${esc(inv.account)} — ${inv.account === 'QAP' ? 'QAP W/ TQL · 168612QAP' : 'NONRECOURSE · 168612NONREC'}</dd>
+<dt>Amount</dt><dd>${fmtMoney(inv.amount_cents)}</dd>
+<dt>Expected fee</dt><dd>${fmtMoney(inv.expected_fee_cents || 0)}</dd>
+${inv.actual_fee_cents != null ? `<dt>Actual fee</dt><dd>${fmtMoney(inv.actual_fee_cents)}${inv.expected_fee_cents != null && inv.actual_fee_cents !== inv.expected_fee_cents ? ` <span class="pill amber">variance ${fmtMoney(inv.actual_fee_cents - inv.expected_fee_cents)}</span>` : ''}</dd>` : ''}
+${inv.funded_cents != null ? `<dt>Funded amount</dt><dd>${fmtMoney(inv.funded_cents)}</dd>` : ''}
+<dt>Payout</dt><dd style="text-align:left">${esc(inv.payout_method || '—')}</dd>
+${inv.hold_reason ? `<dt>Hold reason</dt><dd style="text-align:left">${esc(inv.hold_reason)}</dd>` : ''}
+</dl></div>
+<h2>Packet checklist</h2>
+<div class="card"><dl class="kv">
+<dt>Rate confirmation</dt><dd style="text-align:left">${docs.ratecon ? '✓ on file' : '<b>✗ MISSING</b>'}</dd>
+<dt>POD</dt><dd style="text-align:left">${docs.pod ? '✓ on file' : '<b>✗ MISSING</b>'}</dd>
+<dt>PO #</dt><dd style="text-align:left">${esc(inv.po_number || '✗ not set — RTS disables Submit without one')}</dd>
+<dt>Note for RTS</dt><dd style="text-align:left">All paperwork have been uploaded.</dd>
+</dl>
+${canE ? `<form class="f" method="post" action="/factoring/${inv.id}/po" style="margin-top:10px">
+<div class="rowflex"><div class="row" style="margin:0;min-width:220px"><label>PO # ${inv.account === 'NONRECOURSE' ? '(Armada: the return LoadID on the POD · Spot: the con PO #)' : '(TQL: the load number)'}</label>
+<input name="po_number" value="${esc(inv.po_number || '')}" placeholder="PO #"></div>
+<button class="btn small">Save PO #</button>
+${isOwner && inv.status === 'draft' ? `<button class="btn small" formaction="/factoring/${inv.id}/approve">Approve → ready</button>` : ''}
+</div></form>` : ''}
+<p class="mut" style="margin-top:8px">Documents can only be attached while CREATING the invoice in RTS —
+both files must be on the load before this packet goes over.</p></div>
+${inv.status === 'ready' ? `<h2>RTS-ready submission package</h2>
+<div class="card"><dl class="kv">
+<dt>Account</dt><dd style="text-align:left">${inv.account === 'QAP' ? 'QAP W/ TQL · 168612QAP' : 'NONRECOURSE · 168612NONREC'} (switch in RTS before creating)</dd>
+<dt>Invoice #</dt><dd style="text-align:left">${esc(inv.invoice_number)}</dd>
+<dt>PO #</dt><dd style="text-align:left">${esc(inv.po_number || '')}</dd>
+<dt>Amount</dt><dd>${fmtMoney(inv.amount_cents)}</dd>
+<dt>Note</dt><dd style="text-align:left">All paperwork have been uploaded.</dd>
+<dt>Attach while creating</dt><dd style="text-align:left">rate confirmation + POD from <a href="/loads/${inv.load_id}">the load</a></dd>
+<dt>Payout</dt><dd style="text-align:left">${esc(inv.payout_method || '— choose in RTS (Tree picks each time)')}</dd>
+</dl>
+<p class="mut" style="margin-top:8px">Create + submit this invoice in the RTS portal, then record the outcome
+with the status form below. When it is part of a same-account batch, use
+<a href="/factoring/submit?account=${inv.account}">the batch submit screen</a> instead.</p></div>` : ''}
+<h2>Timeline</h2>
+<div class="tblwrap"><table><tr><th>Step</th><th>When (UTC)</th></tr>${tl || '<tr><td colspan="2" class="mut">No steps recorded yet.</td></tr>'}</table></div>
+${statusForm}` });
+}
+
+function factoringSubmitPage(user, account, batch, q) {
+  const acctLabel = account === 'QAP' ? 'QAP W/ TQL · 168612QAP' : 'NONRECOURSE · 168612NONREC';
+  const rows = batch.map(i => factRow(i)).join('')
+    || '<tr><td colspan="10" class="mut">No ready invoices in this account (Merlin scope, PO # set). Nothing to submit.</td></tr>';
+  const total = batch.reduce((s, i) => s + i.amount_cents, 0);
+  const fees = batch.reduce((s, i) => s + (i.expected_fee_cents || 0), 0);
+  return layout({ title: 'Submit batch', user, active: '/factoring',
+    body: `${flash(q)}<h1>Submit batch — ${esc(account)}</h1>
+<div class="alert">RTS submits <b>everything in the account at once</b>. This batch — ${batch.length} invoice(s),
+${fmtMoney(total)} gross, ${fmtMoney(fees)} expected fees — is exactly what the TMS will mark submitted.
+Check every line against the RTS portal before confirming.</div>
+<div class="card" style="margin-bottom:12px"><dl class="kv">
+<dt>RTS account</dt><dd style="text-align:left">${esc(acctLabel)}</dd>
+<dt>Note on every invoice</dt><dd style="text-align:left">All paperwork have been uploaded.</dd>
+<dt>Documents</dt><dd style="text-align:left">Rate con + POD attach in the portal while creating each invoice — both are on the load (approval checked).</dd>
+</dl></div>
+<div class="tblwrap"><table>${FACT_TBL_HEAD}${rows}</table></div>
+${batch.length ? `<form method="post" action="/factoring/submit-batch" style="margin-top:14px">
+<input type="hidden" name="account" value="${esc(account)}">
+<button class="btn">I submitted these in the RTS portal — record as submitted</button>
+<a class="btn ghost" href="/factoring">Back to board</a></form>` : '<p style="margin-top:14px"><a class="btn ghost" href="/factoring">Back to board</a></p>'}` });
+}
+
+// ---------- AI agents (approvals queue + shift log) ----------
+function agentActionRow(a, isOwner) {
+  const payload = a.payload_obj ? JSON.stringify(a.payload_obj, null, 1) : a.payload;
+  const btns = isOwner && a.status === 'proposed'
+    ? `<form method="post" action="/agents/actions/${a.id}/approve" style="display:inline"><button class="btn small">Approve</button></form>
+       <form method="post" action="/agents/actions/${a.id}/reject" style="display:inline"><button class="btn small danger">Reject</button></form>`
+    : isOwner && a.status === 'approved'
+      ? `<form method="post" action="/agents/actions/${a.id}/execute" style="display:inline"><button class="btn small">Execute</button></form>`
+      : '';
+  return `<div class="card" style="margin-bottom:10px">
+<div class="rowflex"><b>${esc(a.summary)}</b><div class="spacer"></div>
+<span class="pill ${a.status === 'proposed' ? 'amber' : a.status === 'applied' ? 'green' : ''}">${esc(a.status)}</span></div>
+<p class="mut" style="margin:4px 0">${esc(a.agent)} · ${esc(a.kind)} · ${esc(String(a.created_at).slice(0, 16).replace('T', ' '))} UTC
+${a.decided_by ? ` · decided by ${esc(a.decided_by)}` : ''}</p>
+<details><summary class="mut">Exact payload + evidence</summary>
+<pre>${esc(payload)}</pre>${a.evidence ? `<pre>${esc(a.evidence)}</pre>` : ''}</details>
+${a.result ? `<p class="mut" style="margin:6px 0 0">Result: ${esc(a.result)}</p>` : ''}
+<div style="margin-top:8px">${btns}</div></div>`;
 }
 
 module.exports = {
@@ -1498,4 +1724,5 @@ module.exports = {
   driverHome, driverLoads, driverLoadDetail, driverSettlements, driverAnalyzerPage,
   fleetPage, rateconPage, fuelPage, analyzerPage,
   performancePage, fuelDashboardPage, reportsPage,
+  factoringPage, factoringDetailPage, factoringSubmitPage,
 };

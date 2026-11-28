@@ -284,6 +284,66 @@ CREATE TABLE IF NOT EXISTS settlement_adjustments (
 );
 CREATE INDEX IF NOT EXISTS idx_settle_adj_driver
   ON settlement_adjustments(tenant_id, driver_id, week_start);
+
+-- Factoring invoices (MorPro update, Nov 28 2026 — FACTORING-DESIGN.md):
+-- one row per load, drafted automatically on delivery + POD, approved by
+-- the owner, then tracked Submitted -> Purchased -> Funded against RTS.
+-- This table is also the receivables record AR aging will read later.
+CREATE TABLE IF NOT EXISTS factoring_invoices (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id     TEXT NOT NULL,
+  load_id       INTEGER NOT NULL REFERENCES loads(id) ON DELETE CASCADE,
+  invoice_number TEXT NOT NULL,            -- = load number
+  broker        TEXT,
+  account       TEXT NOT NULL CHECK (account IN ('QAP','NONRECOURSE')),
+  po_number     TEXT,
+  amount_cents  INTEGER NOT NULL,          -- LH + FSC (+ detention/accessorial when captured)
+  status        TEXT NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft','ready','submitted','purchased','funded','held','void')),
+  payout_method TEXT,                      -- e.g. 'Standard ACH to PNC ••••6335' (Tree's standing choice)
+  expected_fee_cents INTEGER,
+  actual_fee_cents   INTEGER,
+  funded_cents       INTEGER,
+  hold_reason   TEXT,
+  submitted_at  TEXT, purchased_at TEXT, funded_at TEXT,
+  advanced      INTEGER NOT NULL DEFAULT 0, -- 1 = paid on settlement before funding
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (tenant_id, load_id)
+);
+CREATE INDEX IF NOT EXISTS idx_factinv_status ON factoring_invoices(tenant_id, status);
+
+-- AI agents framework (MorPro update, Nov 28 2026 — AGENTS-DESIGN.md):
+-- agents PROPOSE, Tree APPROVES. agent_actions is the approvals queue;
+-- agent_shift_log is the append-only audit trail of every run, proposal,
+-- decision and execution. No agent writes anywhere else directly.
+CREATE TABLE IF NOT EXISTS agent_actions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id   TEXT NOT NULL,
+  agent       TEXT NOT NULL,        -- 'finance' | 'safety' | 'operations' | 'fuel_ifta' | 'loads'
+  kind        TEXT NOT NULL,        -- 'invoice_draft' | 'settlement_draft' | 'log_annotation'
+                                    -- | 'ratecon_entry' | 'pod_flag' | 'safety_task' | ...
+  summary     TEXT NOT NULL,        -- one line, phone-readable
+  payload     TEXT NOT NULL,        -- JSON: the exact change proposed (shown verbatim pre-approval)
+  evidence    TEXT,                 -- JSON: links/ids the proposal rests on (load #, POD doc id, log id)
+  status      TEXT NOT NULL DEFAULT 'proposed'
+              CHECK (status IN ('proposed','approved','rejected','applied','failed')),
+  decided_by  TEXT, decided_at TEXT,
+  applied_at  TEXT, result TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(tenant_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS agent_shift_log (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id  TEXT NOT NULL,
+  agent      TEXT NOT NULL,
+  event      TEXT NOT NULL,         -- 'run_started' | 'proposed' | 'approved' | 'rejected' | 'applied' | 'error' | 'note'
+  detail     TEXT,
+  action_id  INTEGER REFERENCES agent_actions(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_log ON agent_shift_log(tenant_id, created_at);
 `;
 
 db.exec(SCHEMA);
@@ -375,6 +435,13 @@ function migrate() {
   if (!lcols.includes('delivery_date')) db.exec(`ALTER TABLE loads ADD COLUMN delivery_date TEXT`);
   if (!lcols.includes('pay_override_cents')) db.exec(`ALTER TABLE loads ADD COLUMN pay_override_cents INTEGER`);
   if (!lcols.includes('settlement_id')) db.exec(`ALTER TABLE loads ADD COLUMN settlement_id INTEGER`);
+  // Detention/accessorial capture (factoring design, Nov 28 2026): billed
+  // to the broker/factor on the invoice. Capture only in this phase — the
+  // 60/40 driver split in the settlement engine is a separate, later
+  // golden-test change and pay.js is NOT touched here.
+  if (!lcols.includes('detention_cents')) db.exec(`ALTER TABLE loads ADD COLUMN detention_cents INTEGER`);
+  if (!lcols.includes('accessorial_cents')) db.exec(`ALTER TABLE loads ADD COLUMN accessorial_cents INTEGER`);
+  if (!lcols.includes('accessorial_notes')) db.exec(`ALTER TABLE loads ADD COLUMN accessorial_notes TEXT`);
   const scols = db.prepare(`PRAGMA table_info(sessions)`).all().map(c => c.name);
   // NOTE: plain nullable column on purpose — SQLite's ALTER TABLE rejects
   // expression defaults like (datetime('now')) on some builds, which crashed
@@ -601,6 +668,16 @@ function nearestFuelStops(lat, lon, radiusMi = 60, limit = 5, tenantId = TENANT)
   return scored.slice(0, limit);
 }
 
+// ---- meta key/value (settings: kill switches, US prime rate, ...) ----
+function getMeta(k) {
+  const r = db.prepare('SELECT v FROM meta WHERE k = ?').get(k);
+  return r ? r.v : null;
+}
+function setMeta(k, v) {
+  db.prepare(`INSERT INTO meta (k, v) VALUES (?, ?)
+    ON CONFLICT(k) DO UPDATE SET v = excluded.v`).run(k, v == null ? null : String(v));
+}
+
 // ---- Query helpers ----
 function userCount(tenantId = TENANT) {
   return db.prepare('SELECT COUNT(*) AS c FROM users WHERE tenant_id = ?').get(tenantId).c;
@@ -784,10 +861,16 @@ function saveLoad(l, tenantId = TENANT) {
   // load by accident. Pass an explicit null to clear one.
   let bcName = l.broker_contact_name, bcEmail = l.broker_contact_email, bcPhone = l.broker_contact_phone;
   let deliveryDate = l.delivery_date, payOverride = l.pay_override_cents, settlementId = l.settlement_id;
+  // Detention/accessorial (factoring capture): same preserve-on-undefined
+  // rule — a caller that doesn't pass them must never zero a billed charge.
+  let detC = l.detention_cents, accC = l.accessorial_cents, accN = l.accessorial_notes;
   if (l.id && (bcName === undefined || bcEmail === undefined || bcPhone === undefined
-    || deliveryDate === undefined || payOverride === undefined || settlementId === undefined)) {
+    || deliveryDate === undefined || payOverride === undefined || settlementId === undefined
+    || detC === undefined || accC === undefined || accN === undefined)) {
     const ex = db.prepare(`SELECT broker_contact_name, broker_contact_email, broker_contact_phone,
-        delivery_date, pay_override_cents, settlement_id FROM loads WHERE id = ? AND tenant_id = ?`)
+        delivery_date, pay_override_cents, settlement_id,
+        detention_cents, accessorial_cents, accessorial_notes
+        FROM loads WHERE id = ? AND tenant_id = ?`)
       .get(l.id, tenantId);
     if (ex) {
       if (bcName === undefined) bcName = ex.broker_contact_name;
@@ -796,6 +879,9 @@ function saveLoad(l, tenantId = TENANT) {
       if (deliveryDate === undefined) deliveryDate = ex.delivery_date;
       if (payOverride === undefined) payOverride = ex.pay_override_cents;
       if (settlementId === undefined) settlementId = ex.settlement_id;
+      if (detC === undefined) detC = ex.detention_cents;
+      if (accC === undefined) accC = ex.accessorial_cents;
+      if (accN === undefined) accN = ex.accessorial_notes;
     }
   }
   let id;
@@ -803,7 +889,8 @@ function saveLoad(l, tenantId = TENANT) {
     db.prepare(`UPDATE loads SET date=?, origin=?, destination=?, loaded_miles=?, empty_miles=?,
       linehaul_cents=?, fsc_cents=?, broker=?, broker_contact_name=?, broker_contact_email=?,
       broker_contact_phone=?, driver_id=?, truck_id=?, status=?, notes=?,
-      delivery_date=?, pay_override_cents=?, settlement_id=?
+      delivery_date=?, pay_override_cents=?, settlement_id=?,
+      detention_cents=?, accessorial_cents=?, accessorial_notes=?
       WHERE id=? AND tenant_id=?`)
       .run(l.date, l.origin || null, l.destination || null, l.loaded_miles || 0,
         l.empty_miles || 0, l.linehaul_cents || 0, l.fsc_cents || 0, l.broker || null,
@@ -811,6 +898,7 @@ function saveLoad(l, tenantId = TENANT) {
         l.driver_id || null, l.truck_id || null, l.status || 'delivered', l.notes || null,
         deliveryDate || null, payOverride != null ? payOverride : null,
         settlementId != null ? settlementId : null,
+        detC != null ? detC : null, accC != null ? accC : null, accN || null,
         l.id, tenantId);
     id = l.id;
   } else {
@@ -818,15 +906,17 @@ function saveLoad(l, tenantId = TENANT) {
       (tenant_id, external_id, date, origin, destination, loaded_miles, empty_miles,
        linehaul_cents, fsc_cents, broker, broker_contact_name, broker_contact_email,
        broker_contact_phone, driver_id, truck_id, status, notes,
-       delivery_date, pay_override_cents, settlement_id)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+       delivery_date, pay_override_cents, settlement_id,
+       detention_cents, accessorial_cents, accessorial_notes)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(tenantId, l.external_id || null, l.date, l.origin || null, l.destination || null,
         l.loaded_miles || 0, l.empty_miles || 0, l.linehaul_cents || 0, l.fsc_cents || 0,
         l.broker || null, bcName || null, bcEmail || null, bcPhone || null,
         l.driver_id || null, l.truck_id || null,
         l.status || 'delivered', l.notes || null,
         deliveryDate || null, payOverride != null ? payOverride : null,
-        settlementId != null ? settlementId : null);
+        settlementId != null ? settlementId : null,
+        detC != null ? detC : null, accC != null ? accC : null, accN || null);
     id = r.lastInsertRowid;
   }
   // Book of Brokers auto-update: a load saved with an individual contact
@@ -1185,4 +1275,5 @@ module.exports = {
   recordLogin, recordFailedLogin,
   upsertMotivePosition, listMotivePositions,
   fuelFeedInfo, replaceFuelStops, nearestFuelStops, deliveredLoadsLite,
+  getMeta, setMeta,
 };

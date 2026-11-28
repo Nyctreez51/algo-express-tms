@@ -14,6 +14,7 @@ const AZ = require('./analyze');
 const perf = require('./performance');
 const pay = require('./pay');
 const RC = require('./ratecon');
+const FACT = require('./factoring');
 const v = require('./views');
 const D = require('./dates');
 const { fmtNum } = require('./dates');
@@ -207,6 +208,10 @@ router.post('/api/v1/loads/upsert', apiAuth, express.json(), (req, res) => {
     empty_miles: toNum(b.empty_miles),
     linehaul_cents: toCents(b.linehaul),
     fsc_cents: toCents(b.fuel_surcharge),
+    // Detention/accessorial capture (factoring): undefined = preserve.
+    detention_cents: b.detention !== undefined && b.detention !== null ? toCents(b.detention) : undefined,
+    accessorial_cents: b.accessorial !== undefined && b.accessorial !== null ? toCents(b.accessorial) : undefined,
+    accessorial_notes: b.accessorial_notes !== undefined ? (b.accessorial_notes || null) : undefined,
     broker: b.broker || null,
     // Book of Brokers: undefined = leave stored contact info untouched.
     broker_contact_name: b.broker_contact_name !== undefined ? (b.broker_contact_name || null) : undefined,
@@ -221,7 +226,19 @@ router.post('/api/v1/loads/upsert', apiAuth, express.json(), (req, res) => {
     pay_override_cents: b.pay_override !== undefined && b.pay_override !== null
       ? toCents(b.pay_override) : undefined,
   }, req.tenantId);
+  // Factoring auto-draft hook: a load that lands delivered may be ready
+  // to invoice (drafts only when a POD is already attached).
+  FACT.ensureDraftOnDelivery(r.id, req.tenantId);
   res.json({ ok: true, id: r.id, updated: r.updated });
+});
+
+// Factoring write-back (X-API-Key): Merlin's factoring runs record RTS
+// status here instead of in chat notes. Body identifies the invoice by
+// id, load_external_id or invoice_number; action:'draft' creates a draft.
+router.post('/api/v1/factoring/upsert', apiAuth, express.json(), (req, res) => {
+  const r = FACT.upsertFromApi(req.body || {}, req.tenantId);
+  if (!r.ok) return res.status(400).json(r);
+  res.json({ ok: true, invoice: r.invoice });
 });
 
 router.post('/api/v1/expenses/upsert', apiAuth, express.json(), (req, res) => {
@@ -515,16 +532,20 @@ router.get('/loads/new', auth.canEdit, (req, res) => {
 });
 router.post('/loads/new', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
   const b = req.body;
-  db.saveLoad({
+  const id = db.saveLoad({
     date: b.date, origin: b.origin, destination: b.destination,
     loaded_miles: toNum(b.loaded_miles), empty_miles: toNum(b.empty_miles),
     linehaul_cents: toCents(b.linehaul), fsc_cents: toCents(b.fsc),
+    detention_cents: b.detention === '' || b.detention == null ? null : toCents(b.detention),
+    accessorial_cents: b.accessorial === '' || b.accessorial == null ? null : toCents(b.accessorial),
+    accessorial_notes: b.accessorial_notes || null,
     broker: b.broker, external_id: b.external_id,
     driver_id: b.driver_id || null, truck_id: b.truck_id || null,
     status: b.status, notes: b.notes,
     delivery_date: b.delivery_date || null,
     pay_override_cents: b.pay_override === '' || b.pay_override == null ? null : toCents(b.pay_override),
   });
+  FACT.ensureDraftOnDelivery(id);
   res.redirect('/loads?ok=Load+saved.');
 });
 router.get('/loads/:id/edit', auth.canEdit, (req, res) => {
@@ -539,11 +560,15 @@ router.post('/loads/:id/edit', auth.canEdit, express.urlencoded({ extended: fals
     id: Number(req.params.id), date: b.date, origin: b.origin, destination: b.destination,
     loaded_miles: toNum(b.loaded_miles), empty_miles: toNum(b.empty_miles),
     linehaul_cents: toCents(b.linehaul), fsc_cents: toCents(b.fsc),
+    detention_cents: b.detention === '' || b.detention == null ? null : toCents(b.detention),
+    accessorial_cents: b.accessorial === '' || b.accessorial == null ? null : toCents(b.accessorial),
+    accessorial_notes: b.accessorial_notes || null,
     broker: b.broker, driver_id: b.driver_id || null, truck_id: b.truck_id || null,
     status: b.status, notes: b.notes,
     delivery_date: b.delivery_date || null,
     pay_override_cents: b.pay_override === '' || b.pay_override == null ? null : toCents(b.pay_override),
   });
+  FACT.ensureDraftOnDelivery(Number(req.params.id));
   res.redirect('/loads?ok=Load+updated.');
 });
 router.post('/loads/:id/delete', auth.canEdit, (req, res) => {
@@ -576,7 +601,9 @@ function loadDetailContext(id) {
 router.get('/loads/:id', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
   const ctx = loadDetailContext(req.params.id);
   if (!ctx) return res.status(404).send('Not found');
-  res.send(v.loadDetailPage(req.user, ctx.load, ctx.docs, req.query));
+  const fact = FACT.getInvoiceByLoad(ctx.load.id);
+  if (fact) fact.scope = FACT.scopeForDriverName(ctx.load.driver_name);
+  res.send(v.loadDetailPage(req.user, ctx.load, ctx.docs, req.query, fact));
 });
 
 router.post('/loads/:id/documents', auth.canEdit, (req, res) => {
@@ -604,6 +631,8 @@ router.post('/loads/:id/documents', auth.canEdit, (req, res) => {
         uploaded_by: req.user.id,
       });
     }
+    // A POD landing on a delivered load may complete the factoring packet.
+    if (docType === 'pod') FACT.ensureDraftOnDelivery(load.id);
     res.redirect(`/loads/${load.id}?ok=${encodeURIComponent(req.files.length + ' document(s) uploaded.')}`);
   });
 });
@@ -770,6 +799,57 @@ const reports = require('./reports');
 router.get('/reports', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
   const d = reports.reportsData(req.query);
   res.send(v.reportsPage(req.user, d, req.query, reportPresets()));
+});
+
+// ----- factoring board (Phase A) -----
+router.get('/factoring', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  res.send(v.factoringPage(req.user, FACT.boardData(), req.query));
+});
+// Submit confirm screen BEFORE /factoring/:id so 'submit' isn't an id.
+router.get('/factoring/submit', auth.ownerOnly, (req, res) => {
+  const account = req.query.account === 'QAP' ? 'QAP' : 'NONRECOURSE';
+  res.send(v.factoringSubmitPage(req.user, account, FACT.submitBatchPreview(account), req.query));
+});
+router.post('/factoring/submit-batch', auth.ownerOnly, express.urlencoded({ extended: false }), (req, res) => {
+  const account = req.body.account === 'QAP' ? 'QAP' : 'NONRECOURSE';
+  const batch = FACT.submitBatch(account);
+  res.redirect('/factoring?ok=' + encodeURIComponent(
+    batch.length
+      ? `${batch.length} ${account} invoice(s) recorded as submitted. Record each RTS purchase/funding on its invoice as the portal reports it.`
+      : `No ready ${account} invoices in scope — nothing was submitted.`));
+});
+router.post('/factoring/prime', auth.ownerOnly, express.urlencoded({ extended: false }), (req, res) => {
+  const saved = FACT.setPrimeRate(req.body.prime);
+  res.redirect('/factoring?' + (saved != null
+    ? 'ok=' + encodeURIComponent(`US Prime rate saved: ${saved.toFixed(2)}%. Expected fees now use a ${(Math.max(0, saved - 6.75)).toFixed(2)}% adder.`)
+    : 'err=' + encodeURIComponent('Prime rate not saved — enter a number like 7.00.')));
+});
+router.get('/factoring/:id', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  const inv = FACT.getInvoice(req.params.id);
+  if (!inv) return res.status(404).send('Not found');
+  inv.scope = FACT.scopeForDriverName(inv.driver_name);
+  res.send(v.factoringDetailPage(req.user, inv, FACT.loadDocs(inv.load_id), req.query));
+});
+router.post('/factoring/:id/po', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const inv = FACT.setPo(req.params.id, req.body.po_number);
+  if (!inv) return res.status(404).send('Not found');
+  res.redirect(`/factoring/${inv.id}?ok=` + encodeURIComponent('PO # saved.'));
+});
+router.post('/factoring/:id/approve', auth.ownerOnly, (req, res) => {
+  const r = FACT.approve(req.params.id);
+  if (!r.ok) return res.redirect(`/factoring/${req.params.id}?err=` + encodeURIComponent(r.error));
+  res.redirect(`/factoring/${r.invoice.id}?ok=` + encodeURIComponent('Approved — invoice is ready to submit.'));
+});
+router.post('/factoring/:id/status', auth.canEdit, express.urlencoded({ extended: false }), (req, res) => {
+  const b = req.body;
+  const r = FACT.recordStatus(req.params.id, {
+    status: b.status,
+    funded_cents: b.funded === '' || b.funded == null ? null : toCents(b.funded),
+    actual_fee_cents: b.actual_fee === '' || b.actual_fee == null ? null : toCents(b.actual_fee),
+    hold_reason: b.status === 'held' ? (b.hold_reason || null) : undefined,
+  });
+  if (!r.ok) return res.redirect(`/factoring/${req.params.id}?err=` + encodeURIComponent(r.error));
+  res.redirect(`/factoring/${r.invoice.id}?ok=` + encodeURIComponent('Status recorded.'));
 });
 
 // ----- drivers -----
