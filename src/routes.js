@@ -15,6 +15,7 @@ const perf = require('./performance');
 const pay = require('./pay');
 const RC = require('./ratecon');
 const FACT = require('./factoring');
+const AG = require('./agents');
 const v = require('./views');
 const D = require('./dates');
 const { fmtNum } = require('./dates');
@@ -239,6 +240,31 @@ router.post('/api/v1/factoring/upsert', apiAuth, express.json(), (req, res) => {
   const r = FACT.upsertFromApi(req.body || {}, req.tenantId);
   if (!r.ok) return res.status(400).json(r);
   res.json({ ok: true, invoice: r.invoice });
+});
+
+// Agent proposals (X-API-Key): an agent files a proposal into the
+// approvals queue. Filing is not applying — the executor below is the
+// only path to 'applied', and it refuses anything not owner-approved.
+router.post('/api/v1/agents/propose', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  const r = AG.propose({
+    agent: b.agent, kind: b.kind, summary: b.summary,
+    payload: b.payload || {}, evidence: b.evidence || null,
+  }, req.tenantId);
+  if (!r.ok) return res.status(400).json(r);
+  res.json({ ok: true, id: r.action.id, status: r.action.status });
+});
+
+// Agent executor (X-API-Key): applies APPROVED actions only — one by
+// action_id, or every approved action when no id is given.
+router.post('/api/v1/agents/execute', apiAuth, express.json(), (req, res) => {
+  const b = req.body || {};
+  if (b.action_id) {
+    const r = AG.execute(Number(b.action_id), req.tenantId);
+    return res.json({ ok: r.ok, error: r.error || undefined, action: r.action || undefined });
+  }
+  const results = AG.executeApproved(req.tenantId);
+  res.json({ ok: true, executed: results.length, results });
 });
 
 router.post('/api/v1/expenses/upsert', apiAuth, express.json(), (req, res) => {
@@ -850,6 +876,61 @@ router.post('/factoring/:id/status', auth.canEdit, express.urlencoded({ extended
   });
   if (!r.ok) return res.redirect(`/factoring/${req.params.id}?err=` + encodeURIComponent(r.error));
   res.redirect(`/factoring/${r.invoice.id}?ok=` + encodeURIComponent('Status recorded.'));
+});
+
+// ----- AI agents: approvals queue + shift log (owner only) -----
+router.get('/agents', auth.ownerOnly, (req, res) => {
+  const pending = AG.listActions({ status: 'proposed', limit: 100 });
+  const recent = AG.listActions({ limit: 200 })
+    .filter(a => a.status !== 'proposed').slice(0, 25);
+  const knownKinds = [...new Set([
+    ...Object.keys(AG.autoApplyKinds()),
+    ...AG.listActions({ limit: 200 }).map(a => a.kind),
+    'invoice_draft', 'pod_flag', 'ratecon_entry', 'log_annotation', 'safety_task',
+    ...AG.HARD_GATED_KINDS,
+  ])].sort();
+  res.send(v.agentsPage(req.user, {
+    agentsMeta: AG.AGENTS, pending, recent,
+    enabled: AG.agentsEnabled(), autoApply: AG.autoApplyKinds(),
+    hardGated: AG.HARD_GATED_KINDS, knownKinds,
+  }, req.query));
+});
+router.get('/agents/log', auth.ownerOnly, (req, res) => {
+  res.send(v.agentsLogPage(req.user,
+    AG.listLog({ agent: req.query.agent || null, limit: 300 }), req.query));
+});
+router.post('/agents/run/:agent', auth.ownerOnly, (req, res) => {
+  const agent = String(req.params.agent || '');
+  if (!AG.AGENTS[agent]) return res.status(404).send('Unknown agent');
+  const r = AG.runScan(agent);
+  res.redirect('/agents?ok=' + encodeURIComponent(
+    `${AG.AGENTS[agent].label} scan ran: ${r.proposed} new proposal(s)${r.stub ? ' (stub — framework only in Phase 1)' : ''}.`));
+});
+router.post('/agents/actions/:id/approve', auth.ownerOnly, (req, res) => {
+  const r = AG.approve(req.params.id, req.user.email);
+  res.redirect('/agents?' + (r.ok ? 'ok=' + encodeURIComponent('Proposal approved. Execute it from the queue when ready.')
+    : 'err=' + encodeURIComponent(r.error)));
+});
+router.post('/agents/actions/:id/reject', auth.ownerOnly, (req, res) => {
+  const r = AG.reject(req.params.id, req.user.email);
+  res.redirect('/agents?' + (r.ok ? 'ok=' + encodeURIComponent('Proposal rejected.')
+    : 'err=' + encodeURIComponent(r.error)));
+});
+router.post('/agents/actions/:id/execute', auth.ownerOnly, (req, res) => {
+  const r = AG.execute(req.params.id);
+  res.redirect('/agents?' + (r.ok ? 'ok=' + encodeURIComponent('Executed: ' + (r.action.result || 'applied.'))
+    : 'err=' + encodeURIComponent(r.error || 'Execution failed.')));
+});
+router.post('/agents/toggle', auth.ownerOnly, express.urlencoded({ extended: false }), (req, res) => {
+  const on = req.body.on === '1';
+  AG.setAgentsEnabled(on);
+  AG.logEvent('finance', 'note', `Agents ${on ? 'ENABLED' : 'DISABLED'} by owner (kill switch).`);
+  res.redirect('/agents?ok=' + encodeURIComponent(on ? 'Agents enabled.' : 'Agents disabled — the executor now refuses everything.'));
+});
+router.post('/agents/autoapply', auth.ownerOnly, express.urlencoded({ extended: false }), (req, res) => {
+  const r = AG.setAutoApply(String(req.body.kind || ''), req.body.on === '1');
+  res.redirect('/agents?' + (r.ok ? 'ok=' + encodeURIComponent('Auto-apply setting saved.')
+    : 'err=' + encodeURIComponent(r.error)));
 });
 
 // ----- drivers -----

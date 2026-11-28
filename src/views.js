@@ -115,7 +115,8 @@ function navFor(user) {
       + link('/drivers', 'Drivers', '/drivers') + link('/trucks', 'Trucks', '/trucks');
   }
   if (r === 'owner') {
-    links += link('/users', 'Users', '/users') + link('/api-docs', 'API', '/api-docs');
+    links += link('/agents', 'Agents', '/agents')
+      + link('/users', 'Users', '/users') + link('/api-docs', 'API', '/api-docs');
   }
   const roleLabel = { owner: 'Owner', editor: 'Dispatcher', viewer: 'Viewer' }[r] || r;
   links += `<a href="/logout">Log out (${esc(user.email)} · ${roleLabel})</a>`;
@@ -1713,6 +1714,64 @@ ${a.result ? `<p class="mut" style="margin:6px 0 0">Result: ${esc(a.result)}</p>
 <div style="margin-top:8px">${btns}</div></div>`;
 }
 
+function agentsPage(user, d, q) {
+  const isOwner = user.role === 'owner';
+  const agentCards = Object.entries(d.agentsMeta).map(([key, m]) =>
+    `<div class="card"><b>${esc(m.label)}</b><p class="mut" style="margin:4px 0 8px">${esc(m.blurb)}</p>
+${isOwner ? `<form method="post" action="/agents/run/${key}" style="margin:0"><button class="btn small ghost">Run scan</button></form>` : ''}</div>`).join('');
+  const pending = d.pending.map(a => agentActionRow(a, isOwner)).join('')
+    || '<p class="mut">Queue is clear — no proposals waiting.</p>';
+  const recent = d.recent.map(a => agentActionRow(a, isOwner)).join('')
+    || '<p class="mut">Nothing decided yet.</p>';
+  const kindRows = d.knownKinds.map(k => {
+    const gated = d.hardGated.includes(k);
+    const on = !!d.autoApply[k];
+    return `<tr><td><code>${esc(k)}</code></td>
+<td>${gated ? '<span class="pill amber">approval-required forever</span>' : on ? '<span class="pill green">auto-apply ON</span>' : 'approval required'}</td>
+<td>${isOwner && !gated ? `<form method="post" action="/agents/autoapply" style="margin:0">
+<input type="hidden" name="kind" value="${esc(k)}"><input type="hidden" name="on" value="${on ? '0' : '1'}">
+<button class="btn small ghost">${on ? 'Turn off' : 'Turn on'}</button></form>` : ''}</td></tr>`;
+  }).join('');
+  return layout({ title: 'Agents', user, active: '/agents',
+    body: `${flash(q)}<div class="rowflex"><h1 style="margin:0">AI agents — approvals queue</h1><div class="spacer"></div>
+<a class="btn ghost" href="/agents/log">Shift log</a></div>
+<p class="mut">Agents propose, you approve. Nothing outbound, nothing money-moving, and no log is ever
+changed by an agent — every step lands in the <a href="/agents/log">shift log</a>.</p>
+<div class="grid">${agentCards}</div>
+<div class="card" style="margin-top:12px"><div class="rowflex">
+<b>Kill switch</b><div class="spacer"></div>
+<span class="pill ${d.enabled ? 'green' : 'amber'}">${d.enabled ? 'agents enabled' : 'AGENTS DISABLED'}</span>
+${isOwner ? `<form method="post" action="/agents/toggle" style="margin:0">
+<input type="hidden" name="on" value="${d.enabled ? '0' : '1'}">
+<button class="btn small ${d.enabled ? 'danger' : ''}">${d.enabled ? 'Disable all agents' : 'Enable agents'}</button></form>` : ''}
+</div><p class="mut" style="margin:6px 0 0">When disabled, the executor refuses everything; proposals stay readable.</p></div>
+<h2>Pending proposals (${d.pending.length})</h2>
+${pending}
+<h2>Auto-apply by kind</h2>
+<div class="tblwrap"><table><tr><th>Kind</th><th>Gate</th><th></th></tr>${kindRows}</table></div>
+<p class="mut">Auto-apply is OFF for every kind unless you turn it on here. Settlement drafts, factoring
+submits, outbound messages and WEST SAFETY posts can never be auto-applied.</p>
+<h2>Recently decided</h2>
+${recent}` });
+}
+
+function agentsLogPage(user, rows, q) {
+  const trs = rows.map(r => `<tr><td>${esc(String(r.created_at).slice(0, 16).replace('T', ' '))}</td>
+<td>${esc(r.agent)}</td><td>${esc(r.event)}</td>
+<td style="white-space:normal">${esc(r.detail || '')}</td>
+<td>${r.action_id ? `#${r.action_id}` : ''}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="mut">Shift log is empty.</td></tr>';
+  return layout({ title: 'Agent shift log', user, active: '/agents',
+    body: `${flash(q)}<div class="rowflex"><h1 style="margin:0">Agent shift log</h1><div class="spacer"></div>
+<a class="btn ghost" href="/agents">Approvals queue</a></div>
+<p class="mut">Append-only audit trail: every agent run, proposal, decision and execution.</p>
+<form method="get" action="/agents/log" class="rowflex" style="margin-bottom:10px">
+<select name="agent" style="max-width:200px"><option value="">All agents</option>
+${['finance', 'safety', 'operations', 'fuel_ifta', 'loads'].map(a => `<option value="${a}" ${q && q.agent === a ? 'selected' : ''}>${a}</option>`).join('')}
+</select><button class="btn small">Filter</button></form>
+<div class="tblwrap"><table><tr><th>When (UTC)</th><th>Agent</th><th>Event</th><th>Detail</th><th>Action</th></tr>${trs}</table></div>` });
+}
+
 module.exports = {
   esc, layout, flash,
   setupPage, loginPage,
@@ -1725,4 +1784,5 @@ module.exports = {
   fleetPage, rateconPage, fuelPage, analyzerPage,
   performancePage, fuelDashboardPage, reportsPage,
   factoringPage, factoringDetailPage, factoringSubmitPage,
+  agentsPage, agentsLogPage,
 };
