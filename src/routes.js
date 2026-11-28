@@ -765,6 +765,13 @@ router.get('/fuel-dashboard', auth.requireRoles('owner', 'editor', 'viewer'), (r
   res.send(v.fuelDashboardPage(req.user, d, req.query, reportPresets()));
 });
 
+// ---------- reports hub: P&L, expenses by category, finalized pay summary ---
+const reports = require('./reports');
+router.get('/reports', auth.requireRoles('owner', 'editor', 'viewer'), (req, res) => {
+  const d = reports.reportsData(req.query);
+  res.send(v.reportsPage(req.user, d, req.query, reportPresets()));
+});
+
 // ----- drivers -----
 router.get('/drivers', auth.canEdit, (req, res) => {
   // Active drivers only (Tree, Nov 10 2026): former drivers keep their rows

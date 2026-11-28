@@ -83,6 +83,7 @@ function navFor(user) {
     + link('/fuel', 'Fuel', '/fuel')
     + link('/fuel-dashboard', 'Fuel dashboard', '/fuel-dashboard')
     + link('/performance', 'Performance', '/performance')
+    + link('/reports', 'Reports', '/reports')
     + link('/brokers', 'Brokers', '/brokers')
     + link('/analyzer', 'Analyzer', '/analyzer')
     + link('/ratecon', 'Rate con', '/ratecon')
@@ -1415,6 +1416,58 @@ ${trendRows}</table></div>
 <p class="mut">For discount prices near a truck, see the <a href="/fuel">Fuel discounts</a> page.</p>` });
 }
 
+function reportsPage(user, d, q, presets) {
+  const pl = d.pl;
+  const catRows = pl.catRows.map(x =>
+    `<tr><td style="text-transform:capitalize">${esc(x.category)}</td><td class="num">${x.n}</td>`
+    + `<td class="num">${fmtMoney(x.total)}</td><td class="num">${x.pct.toFixed(1)}%</td></tr>`
+  ).join('');
+  const catTotal = pl.catRows.reduce((s, x) => s + x.total, 0);
+  const catCount = pl.catRows.reduce((s, x) => s + x.n, 0);
+  const ps = d.paySummary;
+  const payRows = ps.rows.map(x =>
+    `<tr><td>${esc(x.driver_name)}</td><td class="num">${x.weeks}</td>`
+    + `<td class="num">${fmtMoney(x.gross)}</td><td class="num">${fmtMoney(x.pay)}</td>`
+    + `<td class="num">${fmtMoney(x.escrow)}</td><td class="num">${fmtMoney(x.adjustments)}</td>`
+    + `<td class="num">${fmtMoney(x.net)}</td></tr>`
+  ).join('') || '<tr><td colspan="7" class="mut">No finalized settlements with a pay week in this range.</td></tr>';
+  const payTot = ps.rows.length ? `<tr><td><strong>All drivers</strong></td><td class="num"><strong>${ps.totals.weeks}</strong></td>`
+    + `<td class="num"><strong>${fmtMoney(ps.totals.gross)}</strong></td><td class="num"><strong>${fmtMoney(ps.totals.pay)}</strong></td>`
+    + `<td class="num"><strong>${fmtMoney(ps.totals.escrow)}</strong></td><td class="num"><strong>${fmtMoney(ps.totals.adjustments)}</strong></td>`
+    + `<td class="num"><strong>${fmtMoney(ps.totals.net)}</strong></td></tr>` : '';
+  return layout({ title: 'Reports', user, active: '/reports',
+    body: `<h1>Reports</h1>${presetLinks(presets, '/reports')}${rangeForm('/reports', q, '')}
+<p class="mut" style="margin:0 0 12px">Delivered loads and expenses from ${esc(pl.from)} to ${esc(pl.to)} · driver pay per the settlements engine · pay summary counts FINALIZED settlements only (pay weeks starting in range).</p>
+<h2>Profit &amp; loss</h2>
+<div class="tblwrap"><table>
+<tr><td>Linehaul revenue</td><td class="num">${fmtMoney(pl.linehaul)}</td></tr>
+<tr><td>Fuel surcharge revenue</td><td class="num">${fmtMoney(pl.fsc)}</td></tr>
+<tr><td><strong>Gross revenue</strong> (${pl.loads} delivered loads)</td><td class="num"><strong>${fmtMoney(pl.gross)}</strong></td></tr>
+<tr><td>Driver pay</td><td class="num">− ${fmtMoney(pl.driverPay)}</td></tr>
+<tr><td><strong>Net after driver pay</strong></td><td class="num"><strong>${fmtMoney(pl.netAfterPay)}</strong></td></tr>
+<tr><td>Operating expenses (all categories)</td><td class="num">− ${fmtMoney(pl.expenses)}</td></tr>
+<tr><td><strong>Operating net</strong></td><td class="num"><strong>${fmtMoney(pl.netAfterAll)}</strong></td></tr>
+</table></div>
+<h2>Expenses by category</h2>
+<div class="tblwrap"><table><tr><th>Category</th><th class="num">Entries</th><th class="num">Total</th><th class="num">% of spend</th></tr>
+${catRows}
+<tr><td><strong>All categories</strong></td><td class="num"><strong>${catCount}</strong></td><td class="num"><strong>${fmtMoney(catTotal)}</strong></td><td class="num"></td></tr>
+</table></div>
+<h2>Driver pay summary — finalized settlements</h2>
+<div class="tblwrap"><table><tr><th>Driver</th><th class="num">Weeks</th><th class="num">Load gross</th><th class="num">Pay</th><th class="num">Escrow withheld</th><th class="num">Adjustments</th><th class="num">Net paid</th></tr>
+${payRows}
+${payTot}
+</table></div>
+<h2>More reports</h2>
+<div class="tblwrap"><table>
+<tr><td><a href="/performance">Performance report</a></td><td>Revenue by broker / shipper, per-driver and per-truck gross, pay and net for any range</td></tr>
+<tr><td><a href="/fuel-dashboard">Fuel dashboard</a></td><td>Fuel by truck (spend, gallons, $/gal, MPG), fuel purchases by state, monthly trend</td></tr>
+<tr><td><a href="/trucks/weekly">Truck weeks</a></td><td>Week-by-week gross, pay, fuel and net per truck</td></tr>
+<tr><td><a href="/settlements">Settlements</a></td><td>Weekly settlement drafts and finalized statements per driver</td></tr>
+</table></div>
+<p class="mut">On the roadmap (see the factoring design): <strong>AR aging</strong> and the <strong>factoring board</strong> arrive with invoice tracking on loads; <strong>detention &amp; accessorials</strong> reporting arrives when those charges are captured on the load; <strong>miles by state</strong> arrives with the Motive mileage import for IFTA. Nothing here estimates them in the meantime.</p>` });
+}
+
 module.exports = {
   esc, layout, flash,
   setupPage, loginPage,
@@ -1425,5 +1478,5 @@ module.exports = {
   usersPage, apiDocsPage,
   driverHome, driverLoads, driverLoadDetail, driverSettlements, driverAnalyzerPage,
   fleetPage, rateconPage, fuelPage, analyzerPage,
-  performancePage, fuelDashboardPage,
+  performancePage, fuelDashboardPage, reportsPage,
 };
