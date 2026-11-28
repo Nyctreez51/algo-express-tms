@@ -42,8 +42,14 @@ function scopeForDriverName(name) {
 // ---- account + PO rules (hard-coded in v1, per design) ----
 function accountForBroker(broker) {
   const b = String(broker || '').toLowerCase();
-  // ONLY TQL goes to QAP. Everything else — incl. C.H. Robinson — NONRECOURSE.
+  // TQL and C.H. Robinson go to QAP (the recourse section) — per Tree,
+  // Nov 28, 2026. Every other broker — NONRECOURSE.
   if (/\btql\b/.test(b) || b.includes('total quality logistics')) return 'QAP';
+  // C.H. Robinson name variants ("C.H. Robinson", "CH Robinson",
+  // "C H Robinson", "Robinson"): normalize punctuation/spacing away and
+  // match the standalone "robinson" token.
+  const norm = b.replace(/[^a-z0-9]+/g, ' ').trim();
+  if (/(^| )robinson( |$)/.test(norm)) return 'QAP';
   return 'NONRECOURSE';
 }
 
@@ -62,10 +68,11 @@ function isSpot(broker) {
   return String(broker || '').toLowerCase().includes('spot');
 }
 
-// PO # suggestion per the design: TQL -> the load number; Armada -> the
-// return LoadID printed on the POD (not stored in the TMS, so null — it is
-// entered at draft review); Spot -> the con's PO # (also not stored
-// structured, so null). Null means "must be entered before approval".
+// PO # suggestion per the design: QAP loads (TQL / C.H. Robinson) -> the
+// load number; Armada -> the return LoadID printed on the POD (not stored
+// in the TMS, so null — it is entered at draft review); Spot -> the con's
+// PO # (also not stored structured, so null). Null means "must be entered
+// before approval".
 function suggestedPo(load) {
   if (accountForBroker(load.broker) === 'QAP') return loadNumber(load);
   return null;
@@ -216,7 +223,35 @@ function missingPodLoads(tenantId = T()) {
   return rows;
 }
 
+// Drafts are unapproved + unsubmitted, so when the account rule changes
+// (CHR -> QAP, Nov 28, 2026) a draft's account is re-derived from its
+// broker here, on board load — account, expected fee, and the PO default
+// (only when no PO has been entered yet) follow the current rule.
+// Ready/submitted/purchased/funded/held invoices are NEVER touched: their
+// recorded account stands.
+function rederiveDraftAccounts(tenantId = T()) {
+  const drafts = db.db.prepare(
+    `SELECT fi.id, fi.account, fi.po_number, fi.amount_cents,
+       l.broker, l.external_id, l.id AS load_id
+     FROM factoring_invoices fi JOIN loads l ON l.id = fi.load_id
+     WHERE fi.tenant_id = ? AND fi.status = 'draft'`).all(tenantId);
+  if (!drafts.length) return;
+  const vol = prior30PurchasedVolumeCents(tenantId);
+  const upd = db.db.prepare(
+    `UPDATE factoring_invoices SET account = ?, po_number = ?,
+       expected_fee_cents = ?, updated_at = datetime('now')
+     WHERE id = ? AND tenant_id = ? AND status = 'draft'`);
+  for (const d of drafts) {
+    const acct = accountForBroker(d.broker);
+    if (acct === d.account) continue;
+    const po = d.po_number
+      || suggestedPo({ broker: d.broker, external_id: d.external_id, id: d.load_id });
+    upd.run(acct, po, expectedFeeCents(d.amount_cents, acct, vol), d.id, tenantId);
+  }
+}
+
 function boardData(tenantId = T()) {
+  rederiveDraftAccounts(tenantId);
   const all = listInvoices(tenantId);
   const by = (s) => all.filter(i => i.status === s);
   const weekAgo = new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10);
@@ -363,6 +398,6 @@ module.exports = {
   getPrimeRate, setPrimeRate, primeAdderPct, tierRatePct, effectiveRatePct,
   expectedFeeCents, prior30PurchasedVolumeCents,
   loadDocs, invoiceAmountCents, createDraftForLoad, ensureDraftOnDelivery,
-  getInvoice, getInvoiceByLoad, listInvoices, missingPodLoads, boardData,
+  getInvoice, getInvoiceByLoad, listInvoices, missingPodLoads, rederiveDraftAccounts, boardData,
   setPo, approve, submitBatchPreview, submitBatch, recordStatus, upsertFromApi,
 };

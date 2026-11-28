@@ -357,7 +357,7 @@ or from the <a href="/factoring">Factoring board</a>.</p></div>`;
   return `<h2>Factoring</h2><div class="card"><dl class="kv">
 <dt>Status</dt><dd style="text-align:left"><span class="pill ${FACT_STATUS_PILL[fact.status] || ''}">${esc(fact.status)}</span>
 <a href="/factoring/${fact.id}">invoice ${esc(fact.invoice_number)}</a></dd>
-<dt>Account</dt><dd style="text-align:left">${esc(fact.account)}${fact.account === 'QAP' ? ' (QAP W/ TQL · 168612QAP)' : ' (NONRECOURSE · 168612NONREC)'}</dd>
+<dt>Account</dt><dd style="text-align:left">${esc(fact.account)}${fact.account === 'QAP' ? ' (QAP W/ TQL + CHR · 168612QAP)' : ' (NONRECOURSE · 168612NONREC)'}</dd>
 <dt>PO #</dt><dd>${esc(fact.po_number || '— not set')}</dd>
 <dt>Amount</dt><dd>${fmtMoney(fact.amount_cents)}</dd>
 <dt>Fee</dt><dd>${feeLine}</dd>
@@ -1564,7 +1564,7 @@ function factoringPage(user, d, q) {
     || '<tr><td colspan="10" class="mut">Every delivered load has a POD on file.</td></tr>';
   const submitLinks = isOwner ? `<div class="rowflex" style="margin:10px 0">
 <a class="btn" href="/factoring/submit?account=NONRECOURSE">Submit NONRECOURSE batch →</a>
-<a class="btn" href="/factoring/submit?account=QAP">Submit QAP (TQL) batch →</a></div>
+<a class="btn" href="/factoring/submit?account=QAP">Submit QAP (TQL + CHR) batch →</a></div>
 <p class="mut">Phase A: the submit screen is the RTS-ready packet (account, PO #, documents, note).
 You submit it in the RTS portal, then confirm here — the TMS records the batch as submitted.
 RTS submits everything in an account at once, so the batch lists every invoice it will carry.</p>` : '';
@@ -1630,7 +1630,7 @@ ${['submitted', 'purchased', 'funded', 'held', 'void'].map(s => `<option value="
 <dt>Broker</dt><dd style="text-align:left">${esc(inv.broker || '—')}</dd>
 <dt>Driver</dt><dd style="text-align:left">${esc(inv.driver_name || '—')}${inv.scope === 'other' ? ' (other scope)' : ''}</dd>
 <dt>Lane</dt><dd style="text-align:left">${esc(inv.origin || '')} → ${esc(inv.destination || '')}</dd>
-<dt>Account</dt><dd style="text-align:left">${esc(inv.account)} — ${inv.account === 'QAP' ? 'QAP W/ TQL · 168612QAP' : 'NONRECOURSE · 168612NONREC'}</dd>
+<dt>Account</dt><dd style="text-align:left">${esc(inv.account)} — ${inv.account === 'QAP' ? 'QAP W/ TQL + CHR · 168612QAP' : 'NONRECOURSE · 168612NONREC'}</dd>
 <dt>Amount</dt><dd>${fmtMoney(inv.amount_cents)}</dd>
 <dt>Expected fee</dt><dd>${fmtMoney(inv.expected_fee_cents || 0)}</dd>
 ${inv.actual_fee_cents != null ? `<dt>Actual fee</dt><dd>${fmtMoney(inv.actual_fee_cents)}${inv.expected_fee_cents != null && inv.actual_fee_cents !== inv.expected_fee_cents ? ` <span class="pill amber">variance ${fmtMoney(inv.actual_fee_cents - inv.expected_fee_cents)}</span>` : ''}</dd>` : ''}
@@ -1646,7 +1646,7 @@ ${inv.hold_reason ? `<dt>Hold reason</dt><dd style="text-align:left">${esc(inv.h
 <dt>Note for RTS</dt><dd style="text-align:left">All paperwork have been uploaded.</dd>
 </dl>
 ${canE ? `<form class="f" method="post" action="/factoring/${inv.id}/po" style="margin-top:10px">
-<div class="rowflex"><div class="row" style="margin:0;min-width:220px"><label>PO # ${inv.account === 'NONRECOURSE' ? '(Armada: the return LoadID on the POD · Spot: the con PO #)' : '(TQL: the load number)'}</label>
+<div class="rowflex"><div class="row" style="margin:0;min-width:220px"><label>PO # ${inv.account === 'NONRECOURSE' ? '(Armada: the return LoadID on the POD · Spot: the con PO #)' : '(TQL/CHR: the load number)'}</label>
 <input name="po_number" value="${esc(inv.po_number || '')}" placeholder="PO #"></div>
 <button class="btn small">Save PO #</button>
 ${isOwner && inv.status === 'draft' ? `<button class="btn small" formaction="/factoring/${inv.id}/approve">Approve → ready</button>` : ''}
@@ -1655,7 +1655,7 @@ ${isOwner && inv.status === 'draft' ? `<button class="btn small" formaction="/fa
 both files must be on the load before this packet goes over.</p></div>
 ${inv.status === 'ready' ? `<h2>RTS-ready submission package</h2>
 <div class="card"><dl class="kv">
-<dt>Account</dt><dd style="text-align:left">${inv.account === 'QAP' ? 'QAP W/ TQL · 168612QAP' : 'NONRECOURSE · 168612NONREC'} (switch in RTS before creating)</dd>
+<dt>Account</dt><dd style="text-align:left">${inv.account === 'QAP' ? 'QAP W/ TQL + CHR · 168612QAP' : 'NONRECOURSE · 168612NONREC'} (switch in RTS before creating)</dd>
 <dt>Invoice #</dt><dd style="text-align:left">${esc(inv.invoice_number)}</dd>
 <dt>PO #</dt><dd style="text-align:left">${esc(inv.po_number || '')}</dd>
 <dt>Amount</dt><dd>${fmtMoney(inv.amount_cents)}</dd>
@@ -1672,7 +1672,7 @@ ${statusForm}` });
 }
 
 function factoringSubmitPage(user, account, batch, q) {
-  const acctLabel = account === 'QAP' ? 'QAP W/ TQL · 168612QAP' : 'NONRECOURSE · 168612NONREC';
+  const acctLabel = account === 'QAP' ? 'QAP W/ TQL + CHR · 168612QAP' : 'NONRECOURSE · 168612NONREC';
   const rows = batch.map(i => factRow(i)).join('')
     || '<tr><td colspan="10" class="mut">No ready invoices in this account (Merlin scope, PO # set). Nothing to submit.</td></tr>';
   const total = batch.reduce((s, i) => s + i.amount_cents, 0);
